@@ -1,27 +1,21 @@
 {
-  "name": "GLE-BOT",
+  "name": "gle-session",
   "version": "1.0.0",
-  "description": "GLE BOT - WhatsApp Pair Code Generator",
-  "main": "index.js",
   "type": "module",
-  "engines": {
-    "node": ">=20.0.0"
-  },
   "scripts": {
     "start": "node index.js",
-    "build": "echo 'No build step required'"
+    "test": "node test-mega.js"
   },
-  "author": "Mr Unique Hacker",
-  "license": "ISC",
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.21",
-    "awesome-phonenumber": "7.2.0",
-    "body-parser": "^1.20.3",
+    "awesome-phonenumber": "^5.11.0",
+    "axios": "^1.13.6",
+    "dotenv": "^16.6.1",
     "express": "^4.22.1",
-    "path": "^0.12.7",
-    "phone": "3.1.55",
-    "pino": "9.5.0",
-    "qrcode": "^1.5.4",
-    "qrcode-terminal": "^0.12.0"
+    "express-rate-limit": "^8.3.1",
+    "megajs": "^1.3.7",
+    "pino": "^8.21.0",
+    "pino-pretty": "^10.3.1",
+    "qrcode": "^1.5.4"
   }
 }

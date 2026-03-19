@@ -1,183 +1,242 @@
 import express from 'express';
 import fs from 'fs';
 import pino from 'pino';
-import { makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore, Browsers, jidNormalizedUser, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, delay, Browsers, fetchLatestBaileysVersion, jidNormalizedUser, DisconnectReason } from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
 import pn from 'awesome-phonenumber';
+import { uploadSession } from './mega.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+import { restoreAndStartBot } from './restore.js';
 
 const router = express.Router();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Ensure the session directory exists
-function removeFile(FilePath) {
+// ==================== CONSTANTS ====================
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
+const TEMP_DIR = path.join(__dirname, 'temp_sessions');
+const SESSION_ID_FILE = path.join(__dirname, '.active_session');
+
+// Ensure temp directory exists
+if (!fs.existsSync(TEMP_DIR)) {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+// Logger
+const logger = pino({
+    level: 'debug',
+    transport: {
+        target: 'pino-pretty',
+        options: { colorize: true }
+    }
+});
+
+// Helper functions
+function makeid(length = 8) {
+    return crypto.randomBytes(length).toString('hex');
+}
+
+function removeFile(filePath) {
     try {
-        if (!fs.existsSync(FilePath)) return false;
-        fs.rmSync(FilePath, { recursive: true, force: true });
+        if (fs.existsSync(filePath)) {
+            fs.rmSync(filePath, { recursive: true, force: true });
+        }
+        return true;
     } catch (e) {
-        console.error('Error removing file:', e);
+        return false;
     }
 }
 
-router.get('/', async (req, res) => {
-    let num = req.query.number;
-    let dirs = './' + (num || `session`);
-
-    // Remove existing session if present
-    await removeFile(dirs);
-
-    // Clean the phone number - remove any non-digit characters
-    num = num.replace(/[^0-9]/g, '');
-
-    // Validate the phone number using awesome-phonenumber
-    const phone = pn('+' + num);
-    if (!phone.isValid()) {
-        if (!res.headersSent) {
-            return res.status(400).send({ code: 'Invalid phone number. Please enter your full international number (e.g., 15551234567 for US, 447911123456 for UK, 84987654321 for Vietnam, etc.) without + or spaces.' });
+// Session export functions
+function collectSessionFiles(sessionDir) {
+    const sessionData = {};
+    const files = fs.readdirSync(sessionDir);
+    
+    for (const file of files) {
+        const filePath = path.join(sessionDir, file);
+        const stat = fs.statSync(filePath);
+        
+        if (stat.isFile()) {
+            const content = fs.readFileSync(filePath);
+            sessionData[file] = {
+                content: content.toString('base64'),
+                size: stat.size,
+                modified: stat.mtimeMs
+            };
         }
-        return;
     }
-    // Use the international number format (E.164, without '+')
-    num = phone.getNumber('e164').replace('+', '');
+    
+    return sessionData;
+}
 
-    async function initiateSession() {
-        const { state, saveCreds } = await useMultiFileAuthState(dirs);
+function encryptSessionPackage(sessionPackage, sessionId) {
+    const key = crypto.createHmac('sha256', Buffer.from(ENCRYPTION_KEY, 'hex'))
+        .update(sessionId)
+        .digest();
+    
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+    
+    let encrypted = cipher.update(JSON.stringify(sessionPackage), 'utf8', 'base64');
+    encrypted += cipher.final('base64');
+    
+    const encryptedPackage = {
+        iv: iv.toString('base64'),
+        data: encrypted,
+        sessionId: sessionId
+    };
+    
+    return Buffer.from(JSON.stringify(encryptedPackage)).toString('base64');
+}
 
-        try {
-            const { version, isLatest } = await fetchLatestBaileysVersion();
-            let GleBot = makeWASocket({
-                version,
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-                },
-                printQRInTerminal: false,
-                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-                browser: Browsers.windows('Chrome'),
-                markOnlineOnConnect: false,
-                generateHighQualityLinkPreview: false,
-                defaultQueryTimeoutMs: 60000,
-                connectTimeoutMs: 60000,
-                keepAliveIntervalMs: 30000,
-                retryRequestDelayMs: 250,
-                maxRetries: 5,
-            });
+// Main pairing endpoint
+router.get('/', async (req, res) => {
+    const sessionId = makeid();
+    let { number } = req.query;
+    const sessionDir = path.join(TEMP_DIR, sessionId);
 
-            GleBot.ev.on('connection.update', async (update) => {
-                const { connection, lastDisconnect, isNewLogin, isOnline } = update;
+    console.log(`\n🔷 [${sessionId}] Pairing session started`);
 
-                if (connection === 'open') {
-                    console.log("✅ Connected successfully!");
-                    console.log("📱 Sending session file to user...");
-                    
-                    try {
-                        const sessionGle = fs.readFileSync(dirs + '/creds.json');
+    try {
+        // Validate number
+        if (!number) {
+            return res.status(400).json({ success: false, error: 'Phone number required' });
+        }
 
-                        // Send session file to user
-                        const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
-                        await GleBot.sendMessage(userJid, {
-                            document: sessionGle,
-                            mimetype: 'application/json',
-                            fileName: 'creds.json'
-                        });
-                        console.log("📄 Session file sent successfully");
+        number = number.replace(/\D/g, '');
+        const phone = pn('+' + number);
+        
+        if (!phone.isValid()) {
+            return res.status(400).json({ success: false, error: 'Invalid phone number' });
+        }
 
-                        // Send video thumbnail with caption
-                        await GleBot.sendMessage(userJid, {
-                            image: { url: 'https://files.catbox.moe/yshuso.jpg' },
-                            caption: `🎬 *GLE BOT MD V1.0 Full Setup Guide!*\n\n🚀 Bug Fixes + New Commands + Fast AI Chat\n📺 join Now: https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x`
-                        });
-                        console.log("🎬 Video guide sent successfully");
+        const formattedNumber = phone.getNumber('e164').replace('+', '');
+        
+        // Create session directory
+        fs.mkdirSync(sessionDir, { recursive: true });
 
-                        // Send warning message
-                        await GleBot.sendMessage(userJid, {
-                            text: `⚠️Do not share this file with anybody⚠️\n 
-┌┤✑  Thanks for using GleBot
-│└────────────┈ ⳹        
-│©2026  | GLEBOT Inc. All rights reserved.
-└─────────────────┈ ⳹\n\n`
-                        });
-                        console.log("⚠️ Warning message sent successfully");
+        // Load auth state
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        const { version } = await fetchLatestBaileysVersion();
 
-                        // Clean up session after use
-                        console.log("🧹 Cleaning up session...");
-                        await delay(1000);
-                        removeFile(dirs);
-                        console.log("✅ Session cleaned up successfully");
-                        console.log("🎉 Process completed successfully!");
-                        // Do not exit the process, just finish gracefully
-                    } catch (error) {
-                        console.error("❌ Error sending messages:", error);
-                        // Still clean up session even if sending fails
-                        removeFile(dirs);
-                        // Do not exit the process, just finish gracefully
-                    }
-                }
+        // Create socket
+        const sock = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: false,
+            logger,
+            browser: Browsers.windows("Chrome"),
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
+            keepAliveIntervalMs: 30000,
+            defaultQueryTimeoutMs: 60000
+        });
 
-                if (isNewLogin) {
-                    console.log("🔐 New login via pair code");
-                }
+        sock.ev.on('creds.update', saveCreds);
 
-                if (isOnline) {
-                    console.log("📶 Client is online");
-                }
+        let codeGenerated = false;
+        let responseSent = false;
 
-                if (connection === 'close') {
-                    const statusCode = lastDisconnect?.error?.output?.statusCode;
+        // Handle connection updates
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
+            
+            console.log(`🔔 [${sessionId}] Connection: ${connection}`);
 
-                    if (statusCode === 401) {
-                        console.log("❌ Logged out from WhatsApp. Need to generate new pair code.");
-                    } else {
-                        console.log("🔁 Connection closed — restarting...");
-                        initiateSession();
-                    }
-                }
-            });
-
-            if (!GleBot.authState.creds.registered) {
-                await delay(3000); // Wait 3 seconds before requesting pairing code
-                num = num.replace(/[^\d+]/g, '');
-                if (num.startsWith('+')) num = num.substring(1);
+            if (connection === 'open') {
+                console.log(`✅ [${sessionId}] Connected!`);
+                
+                // Wait for files to save
+                await delay(5000);
 
                 try {
-                    let code = await GleBot.requestPairingCode(num);
-                    code = code?.match(/.{1,4}/g)?.join('-') || code;
-                    if (!res.headersSent) {
-                        console.log({ num, code });
-                        await res.send({ code });
+                    // Export session
+                    const sessionFiles = collectSessionFiles(sessionDir);
+                    const sessionPackage = {
+                        id: sessionId,
+                        user: sock.user?.id,
+                        number: formattedNumber,
+                        timestamp: Date.now(),
+                        files: sessionFiles
+                    };
+                    
+                    const sessionString = encryptSessionPackage(sessionPackage, sessionId);
+                    
+                    // Upload to Mega
+                    let megaUrl = null;
+                    try {
+                        megaUrl = await uploadSession(sessionString, sessionId);
+                    } catch (megaError) {
+                        console.error(`Mega upload failed:`, megaError);
                     }
+                    
+                    // Save session ID for auto-restore
+                    fs.writeFileSync(SESSION_ID_FILE, sessionId);
+                    
+                    // Send to user
+                    const userJid = jidNormalizedUser(formattedNumber + '@s.whatsapp.net');
+                    
+                    await sock.sendMessage(userJid, {
+                        text: `🔐 *GLE Session String*\n\n\`${sessionString}\``
+                    });
+
+                    if (megaUrl) {
+                        await sock.sendMessage(userJid, {
+                            text: `📦 *Mega Backup*\n\n${megaUrl}`
+                        });
+                    }
+
+                    await sock.sendMessage(userJid, {
+                        text: `✅ *Bot Active!*\n\nSession saved and will auto-restore on server restart.`
+                    });
+
+                    console.log(`✅ [${sessionId}] Session exported`);
+                    
                 } catch (error) {
-                    console.error('Error requesting pairing code:', error);
-                    if (!res.headersSent) {
-                        res.status(503).send({ code: 'Failed to get pairing code. Please check your phone number and try again.' });
-                    }
+                    console.error(`Export error:`, error);
                 }
             }
 
-            GleBot.ev.on('creds.update', saveCreds);
-        } catch (err) {
-            console.error('Error initializing session:', err);
-            if (!res.headersSent) {
-                res.status(503).send({ code: 'Service Unavailable' });
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.log(`🔴 [${sessionId}] Closed:`, statusCode);
+            }
+        });
+
+        // Request pairing code
+        if (!sock.authState.creds.registered) {
+            await delay(3000);
+            
+            try {
+                const code = await sock.requestPairingCode(formattedNumber);
+                const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
+                codeGenerated = true;
+                
+                if (!res.headersSent) {
+                    responseSent = true;
+                    res.json({
+                        success: true,
+                        code: formattedCode,
+                        sessionId: sessionId,
+                        message: 'Enter code in WhatsApp Linked Devices',
+                        expiresIn: 180
+                    });
+                }
+            } catch (error) {
+                console.error(`Code error:`, error);
+                if (!res.headersSent) {
+                    res.status(500).json({ success: false, error: 'Failed to generate code' });
+                }
             }
         }
+
+    } catch (error) {
+        console.error(`Fatal error:`, error);
+        if (!res.headersSent) {
+            res.status(500).json({ success: false, error: error.message });
+        }
     }
-
-    await initiateSession();
-});
-
-// Global uncaught exception handler
-process.on('uncaughtException', (err) => {
-    let e = String(err);
-    if (e.includes("conflict")) return;
-    if (e.includes("not-authorized")) return;
-    if (e.includes("Socket connection timeout")) return;
-    if (e.includes("rate-overlimit")) return;
-    if (e.includes("Connection Closed")) return;
-    if (e.includes("Timed Out")) return;
-    if (e.includes("Value not found")) return;
-    if (e.includes("Stream Errored")) return;
-    if (e.includes("Stream Errored (restart required)")) return;
-    if (e.includes("statusCode: 515")) return;
-    if (e.includes("statusCode: 503")) return;
-    console.log('Caught exception: ', err);
 });
 
 export default router;
