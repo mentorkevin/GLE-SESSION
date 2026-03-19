@@ -77,7 +77,9 @@ router.get('/', async (req, res) => {
             markOnlineOnConnect: false,
             keepAliveIntervalMs: 30000,
             defaultQueryTimeoutMs: 60000,
-            connectTimeoutMs: 60000
+            connectTimeoutMs: 60000,
+            // Important: Let the socket auto-reconnect
+            shouldSyncHistoryMessage: false
         });
         
         sock.ev.on('creds.update', saveCreds);
@@ -88,6 +90,7 @@ router.get('/', async (req, res) => {
         let responseSent = false;
         let loggedIn = false;
         let apiResponseSent = false;
+        let pairingConfigured = false;
         
         // ✅ INCREASED QR TIMEOUT: 3 minutes (180 seconds)
         const QR_TIMEOUT = 180000; // 180 seconds
@@ -135,17 +138,35 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // Don't cleanup on close - let it reconnect
+            // Track when pairing is configured (user scanned QR)
+            if (connection === 'connecting' && !pairingConfigured) {
+                console.log(`📱 [${sessionId}] Pairing detected - waiting for login...`);
+                pairingConfigured = true;
+            }
+            
+            // Handle close - but DON'T cleanup if pairing was configured
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 console.log(`[${sessionId}] Closed with code:`, statusCode);
-                // Don't cleanup - socket will reconnect automatically
-                return;
+                
+                // If pairing was configured (user scanned QR), this is expected restart
+                if (pairingConfigured && !loggedIn) {
+                    console.log(`🔄 [${sessionId}] Expected restart after pairing - waiting for reconnect...`);
+                    // DON'T cleanup - socket will auto-reconnect
+                    return;
+                }
+                
+                // If no pairing and not logged in, cleanup
+                if (!loggedIn && !pairingConfigured) {
+                    console.log(`[${sessionId}] Connection closed without login - cleaning up`);
+                    activeSessions.delete(sessionId);
+                    removeFile(sessionDir);
+                }
             }
             
-            // ✅ CRITICAL FIX: detect login EVEN after restart
+            // ✅ Check for login on any connection update
             if (sock.user && !loggedIn) {
-                console.log(`🎉 [${sessionId}] LOGIN DETECTED (fallback) via sock.user`);
+                console.log(`🎉 [${sessionId}] LOGIN DETECTED!`);
                 console.log(`👤 User: ${sock.user.id}`);
                 
                 loggedIn = true;
@@ -162,6 +183,10 @@ router.get('/', async (req, res) => {
                     // Collect session files
                     console.log(`📁 [${sessionId}] Collecting session files...`);
                     const sessionFiles = collectSessionFiles(sessionDir);
+                    
+                    if (Object.keys(sessionFiles).length === 0) {
+                        throw new Error('No session files found');
+                    }
                     
                     const sessionPackage = {
                         id: sessionId,
@@ -256,15 +281,9 @@ router.get('/', async (req, res) => {
                     removeFile(sessionDir);
                 }
             }
-            
-            // Also keep the original connection-based detection as backup
-            if (connection === 'open' && sock.user && !loggedIn) {
-                // This will also trigger, but the fallback above already caught it
-                console.log(`[${sessionId}] Login also detected via connection.open`);
-            }
         });
         
-        // Timeout for QR generation - increased to 30s is fine, this is just for generation
+        // Timeout for QR generation - 30s is fine for generation
         setTimeout(() => {
             if (!qrSent && !responseSent) {
                 res.status(504).json({ success: false, error: 'QR generation timeout' });
