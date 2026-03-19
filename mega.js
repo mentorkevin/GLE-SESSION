@@ -5,7 +5,16 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+<<<<<<< HEAD
 dotenv.config();
+=======
+// Mega authentication credentials
+const auth = {
+    email: 'name@gmail.com', // Replace with your Mega email
+    password: 'name76oj', // Replace with your Mega password
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.246'
+};
+>>>>>>> 260bae5be402090226f17d91bbda4adf167b9d1b
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
