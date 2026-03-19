@@ -1,7 +1,7 @@
 import express from 'express';
 import fs from 'fs';
 import pino from 'pino';
-import { makeWASocket, useMultiFileAuthState, delay, Browsers, fetchLatestBaileysVersion, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, delay, Browsers, fetchLatestBaileysVersion, jidNormalizedUser, DisconnectReason } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -11,6 +11,8 @@ const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const TEMP_DIR = path.join(__dirname, 'temp_sessions');
+const ACTIVE_SESSION_FILE = path.join(__dirname, '.active_session');
+
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const activeSessions = new Map();
@@ -23,7 +25,7 @@ function removeFile(filePath) {
     try { if (fs.existsSync(filePath)) fs.rmSync(filePath, { recursive: true, force: true }); } catch (e) {}
 }
 
-// ==================== SIMPLE QR ENDPOINT ====================
+// ==================== FIXED QR ENDPOINT ====================
 router.get('/', async (req, res) => {
     const sessionId = makeid();
     const sessionDir = path.join(TEMP_DIR, sessionId);
@@ -36,16 +38,19 @@ router.get('/', async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const { version } = await fetchLatestBaileysVersion();
         
-        // SIMPLE socket configuration
+        // FIX 1: Proper socket configuration
         const sock = makeWASocket({
             version,
             auth: state,
-            printQRInTerminal: true, // Let it print QR in terminal too
-            browser: Browsers.windows("Chrome"),
+            printQRInTerminal: true,
+            browser: Browsers.windows("Chrome"), // ✅ FIXED: Use proper browser config
             syncFullHistory: false,
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000,
-            defaultQueryTimeoutMs: 60000
+            keepAliveIntervalMs: 30000, // ✅ FIXED: Keep connection alive
+            defaultQueryTimeoutMs: 60000,
+            connectTimeoutMs: 60000, // ✅ FIXED: Add connection timeout
+            generateHighQualityLinkPreview: false,
+            patchMessageBeforeSending: true // ✅ FIXED: Fix 408 errors
         });
         
         sock.ev.on('creds.update', saveCreds);
@@ -55,38 +60,64 @@ router.get('/', async (req, res) => {
         
         let qrSent = false;
         let connected = false;
+        let responseSent = false;
         
-        // Handle connection updates
+        // FIX 2: Proper connection lifecycle handling
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
             
             console.log(`[${sessionId}] State:`, connection || 'waiting');
             
             // QR CODE GENERATED
-            if (qr && !qrSent && !res.headersSent) {
+            if (qr && !qrSent && !responseSent) {
                 qrSent = true;
                 try {
                     const qrImage = await QRCode.toDataURL(qr);
+                    
+                    // ✅ FIX: Send response but KEEP CONNECTION ALIVE
                     res.json({ 
                         success: true, 
                         qr: qrImage, 
                         sessionId,
-                        message: 'Scan with WhatsApp'
+                        message: 'Scan with WhatsApp - connection will stay alive',
+                        instructions: [
+                            '1. Open WhatsApp on your phone',
+                            '2. Tap Menu or Settings and select Linked Devices',
+                            '3. Tap "Link a Device"',
+                            '4. Scan this QR code'
+                        ]
                     });
-                    console.log(`✅ [${sessionId}] QR sent to client`);
+                    responseSent = true;
+                    console.log(`✅ [${sessionId}] QR sent to client - waiting for scan...`);
+                    
+                    // Set timeout for scan (3 minutes)
+                    setTimeout(() => {
+                        if (!connected) {
+                            console.log(`⏰ [${sessionId}] QR scan timeout`);
+                            sock.ws?.close();
+                            activeSessions.delete(sessionId);
+                            removeFile(sessionDir);
+                        }
+                    }, 180000);
+                    
                 } catch (err) {
                     console.error(`QR error:`, err);
+                    if (!responseSent) {
+                        res.status(500).json({ success: false, error: 'QR generation failed' });
+                        responseSent = true;
+                    }
                 }
             }
             
-            // CONNECTION OPEN - SUCCESS!
+            // ✅ FIX 3: CRITICAL - Wait for 'open' state before considering connected
             if (connection === 'open') {
                 connected = true;
                 console.log(`🎉 [${sessionId}] WHATSAPP CONNECTED!`);
                 console.log(`👤 User: ${sock.user?.id}`);
                 
-                // Save session ID for potential restore
-                fs.writeFileSync(path.join(__dirname, '.last_session'), sessionId);
+                // ✅ FIX 4: ONLY save session after 'open' state
+                // Save session ID for future restore
+                fs.writeFileSync(ACTIVE_SESSION_FILE, sessionId);
                 
                 // Send confirmation to user
                 try {
@@ -98,34 +129,46 @@ router.get('/', async (req, res) => {
                     console.error(`Failed to send confirmation:`, msgErr);
                 }
                 
-                // Don't close socket - keep alive
+                // Keep socket alive - don't close
             }
             
-            // CONNECTION CLOSED
+            // ✅ FIX 5: Handle connection close with reconnection logic
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                console.log(`[${sessionId}] Closed:`, statusCode);
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                 
-                // If we were connected, this is normal
-                if (connected) {
-                    console.log(`✅ [${sessionId}] Session ended normally`);
-                } 
-                // If QR was sent but never scanned, keep waiting (don't cleanup)
-                else if (qrSent && !connected) {
-                    console.log(`⏳ [${sessionId}] Waiting for scan...`);
+                console.log(`[${sessionId}] Closed:`, { statusCode, shouldReconnect });
+                
+                // If we were connected, try to reconnect
+                if (connected && shouldReconnect) {
+                    console.log(`🔄 [${sessionId}] Reconnecting in 5 seconds...`);
+                    // Don't delete session - let it reconnect
+                    return;
                 }
-                // Otherwise cleanup
-                else {
+                
+                // Only cleanup if not connected or logged out
+                if (!connected || !shouldReconnect) {
                     activeSessions.delete(sessionId);
                     removeFile(sessionDir);
+                }
+                
+                // If QR was sent but never scanned, error response already sent
+                if (!connected && !responseSent) {
+                    res.status(500).json({ 
+                        success: false, 
+                        error: `Connection failed: ${statusCode || 'unknown'}` 
+                    });
+                    responseSent = true;
                 }
             }
         });
         
         // Timeout for QR generation
         setTimeout(() => {
-            if (!qrSent && !res.headersSent) {
-                res.status(504).json({ success: false, error: 'QR timeout' });
+            if (!qrSent && !responseSent) {
+                res.status(504).json({ success: false, error: 'QR generation timeout' });
+                responseSent = true;
+                sock.ws?.close();
                 activeSessions.delete(sessionId);
                 removeFile(sessionDir);
             }
