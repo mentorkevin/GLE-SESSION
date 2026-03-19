@@ -127,16 +127,41 @@ function restoreSessionFiles(sessionPackage, restorePath) {
 }
 
 /**
- * Start bot with restored session
+ * ✅ EXPORTED FUNCTION: Restore and start bot
  */
-async function startBotWithRestoredSession(sessionId, restorePath) {
-    console.log(`\n🤖 [BOT] Starting bot with restored session: ${sessionId}`);
+export async function restoreAndStartBot(sessionIdOrUrl) {
+    console.log(`\n🔄 [RESTORE] restoreAndStartBot called with: ${sessionIdOrUrl}`);
     
     try {
-        // Check if session files exist
-        if (!fs.existsSync(restorePath) || fs.readdirSync(restorePath).length === 0) {
-            throw new Error('No session files found');
+        let sessionString;
+        let source;
+        
+        // Check if it's a Mega URL
+        if (sessionIdOrUrl.startsWith('https://mega.nz/') || sessionIdOrUrl.startsWith('mega://')) {
+            console.log(`📥 [RESTORE] Downloading from Mega...`);
+            source = 'mega';
+            const downloadResult = await downloadSession(sessionIdOrUrl);
+            sessionString = downloadResult.data;
+        } else {
+            // Assume it's a session string
+            console.log(`📥 [RESTORE] Using provided session string`);
+            source = 'string';
+            sessionString = sessionIdOrUrl;
         }
+        
+        // Decrypt session
+        console.log(`🔓 [RESTORE] Decrypting session...`);
+        const sessionPackage = decryptSessionString(sessionString);
+        
+        const sessionId = sessionPackage.id;
+        const restorePath = path.join(RESTORE_DIR, sessionId);
+        
+        // Restore files
+        console.log(`📁 [RESTORE] Restoring session files...`);
+        restoreSessionFiles(sessionPackage, restorePath);
+        
+        // Start bot
+        console.log(`🤖 [RESTORE] Starting bot...`);
         
         // Load auth state
         const { state, saveCreds } = await useMultiFileAuthState(restorePath);
@@ -185,7 +210,7 @@ async function startBotWithRestoredSession(sessionId, restorePath) {
                 if (statusCode !== DisconnectReason.loggedOut) {
                     console.log(`🔄 [BOT:${sessionId}] Attempting to reconnect in 5 seconds...`);
                     setTimeout(() => {
-                        startBotWithRestoredSession(sessionId, restorePath);
+                        restoreAndStartBot(sessionIdOrUrl);
                     }, 5000);
                 } else {
                     // Logged out - remove from active bots
@@ -194,16 +219,17 @@ async function startBotWithRestoredSession(sessionId, restorePath) {
             }
         });
         
-        console.log(`✅ [BOT:${sessionId}] Bot started successfully`);
+        console.log(`✅ [RESTORE] Bot started successfully`);
         
         return {
             success: true,
             sock,
-            userId: sock.user?.id
+            userId: sock.user?.id,
+            sessionId
         };
         
     } catch (error) {
-        console.error(`❌ [BOT:${sessionId}] Failed to start bot:`, error);
+        console.error(`❌ [RESTORE] Restore failed:`, error);
         return {
             success: false,
             error: error.message
@@ -217,8 +243,6 @@ async function startBotWithRestoredSession(sessionId, restorePath) {
  * RESTORE FROM MEGA URL
  * POST /restore
  * Body: { megaUrl }
- * 
- * Flow: Mega → download → decrypt → restore files → start bot
  */
 router.post('/', async (req, res) => {
     try {
@@ -231,66 +255,21 @@ router.post('/', async (req, res) => {
             });
         }
         
-        console.log(`\n🔄 [RESTORE] Starting restore from Mega: ${megaUrl}`);
+        const result = await restoreAndStartBot(megaUrl);
         
-        // ✅ STEP 1: Download from Mega
-        console.log(`📥 [RESTORE] Downloading from Mega...`);
-        let downloadResult;
-        try {
-            downloadResult = await downloadSession(megaUrl);
-        } catch (error) {
-            return res.status(400).json({
-                success: false,
-                error: `Failed to download from Mega: ${error.message}`
-            });
-        }
-        
-        const sessionString = downloadResult.data;
-        console.log(`✅ [RESTORE] Download complete`);
-        
-        // ✅ STEP 2: Decrypt session
-        console.log(`🔓 [RESTORE] Decrypting session...`);
-        let sessionPackage;
-        try {
-            sessionPackage = decryptSessionString(sessionString);
-        } catch (error) {
-            return res.status(400).json({
-                success: false,
-                error: `Failed to decrypt session: ${error.message}`
-            });
-        }
-        
-        const sessionId = sessionPackage.id;
-        const restorePath = path.join(RESTORE_DIR, sessionId);
-        
-        // ✅ STEP 3: Restore files
-        console.log(`📁 [RESTORE] Restoring session files...`);
-        try {
-            restoreSessionFiles(sessionPackage, restorePath);
-        } catch (error) {
-            return res.status(500).json({
-                success: false,
-                error: `Failed to restore files: ${error.message}`
-            });
-        }
-        
-        // ✅ STEP 4: Start bot
-        console.log(`🤖 [RESTORE] Starting bot...`);
-        const botResult = await startBotWithRestoredSession(sessionId, restorePath);
-        
-        if (botResult.success) {
+        if (result.success) {
             res.json({
                 success: true,
                 data: {
-                    sessionId,
-                    userId: botResult.userId,
+                    sessionId: result.sessionId,
+                    userId: result.userId,
                     message: 'Session restored and bot started successfully'
                 }
             });
         } else {
             res.status(500).json({
                 success: false,
-                error: botResult.error
+                error: result.error
             });
         }
         
@@ -304,7 +283,7 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * RESTORE FROM SESSION STRING (direct)
+ * RESTORE FROM SESSION STRING
  * POST /restore/from-string
  * Body: { sessionString }
  */
@@ -319,51 +298,21 @@ router.post('/from-string', async (req, res) => {
             });
         }
         
-        console.log(`\n🔄 [RESTORE] Starting restore from session string`);
+        const result = await restoreAndStartBot(sessionString);
         
-        // ✅ STEP 1: Decrypt session
-        console.log(`🔓 [RESTORE] Decrypting session...`);
-        let sessionPackage;
-        try {
-            sessionPackage = decryptSessionString(sessionString);
-        } catch (error) {
-            return res.status(400).json({
-                success: false,
-                error: `Failed to decrypt session: ${error.message}`
-            });
-        }
-        
-        const sessionId = sessionPackage.id;
-        const restorePath = path.join(RESTORE_DIR, sessionId);
-        
-        // ✅ STEP 2: Restore files
-        console.log(`📁 [RESTORE] Restoring session files...`);
-        try {
-            restoreSessionFiles(sessionPackage, restorePath);
-        } catch (error) {
-            return res.status(500).json({
-                success: false,
-                error: `Failed to restore files: ${error.message}`
-            });
-        }
-        
-        // ✅ STEP 3: Start bot
-        console.log(`🤖 [RESTORE] Starting bot...`);
-        const botResult = await startBotWithRestoredSession(sessionId, restorePath);
-        
-        if (botResult.success) {
+        if (result.success) {
             res.json({
                 success: true,
                 data: {
-                    sessionId,
-                    userId: botResult.userId,
+                    sessionId: result.sessionId,
+                    userId: result.userId,
                     message: 'Session restored and bot started successfully'
                 }
             });
         } else {
             res.status(500).json({
                 success: false,
-                error: botResult.error
+                error: result.error
             });
         }
         
