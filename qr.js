@@ -88,7 +88,6 @@ router.get('/', async (req, res) => {
         let responseSent = false;
         let loginCompleted = false;
         let apiResponseSent = false;
-        let reconnectCount = 0;
         
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
@@ -131,146 +130,125 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // ✅ HANDLE RECONNECT AFTER LOGIN
+            // Don't cleanup on close - let it reconnect
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 console.log(`[${sessionId}] Closed with code:`, statusCode);
-                
-                // WhatsApp ALWAYS restarts after login (code 515)
-                if (statusCode === 515) {
-                    reconnectCount++;
-                    console.log(`🔄 [${sessionId}] WhatsApp restart #${reconnectCount} - this is NORMAL`);
-                    
-                    if (!loginCompleted) {
-                        console.log(`⏳ [${sessionId}] Waiting for reconnect after login...`);
-                        return; // Don't cleanup - wait for reconnect
-                    }
-                }
-                
-                // If login never happened and not a restart, cleanup
-                if (!loginCompleted) {
-                    console.log(`[${sessionId}] Connection closed without login - cleaning up`);
-                    activeSessions.delete(sessionId);
-                    removeFile(sessionDir);
-                }
+                // Don't cleanup - socket will reconnect automatically
+                return;
             }
             
-            // ✅ CORRECT LOGIN DETECTION: Wait for stable connection with sock.user
+            // ✅ SIMPLE LOGIN DETECTION: Once we have sock.user, login is complete
             if (connection === 'open' && sock.user && !loginCompleted) {
-                // Make sure we're past the initial restarts
-                if (reconnectCount >= 1) {
-                    console.log(`🎉 [${sessionId}] LOGIN SUCCESSFUL after ${reconnectCount} restarts!`);
-                    console.log(`👤 User: ${sock.user.id}`);
+                console.log(`🎉 [${sessionId}] LOGIN SUCCESSFUL!`);
+                console.log(`👤 User: ${sock.user.id}`);
+                
+                loginCompleted = true;
+                
+                // ✅ STEP 1: Force save credentials immediately
+                console.log(`💾 [${sessionId}] Forcing credentials save...`);
+                await saveCreds();
+                
+                // ✅ STEP 2: Wait 4 seconds for files to fully write on Render
+                console.log(`⏳ [${sessionId}] Waiting 4 seconds for files to stabilize on Render...`);
+                await delay(4000);
+                
+                try {
+                    // Collect session files
+                    console.log(`📁 [${sessionId}] Collecting session files...`);
+                    const sessionFiles = collectSessionFiles(sessionDir);
                     
-                    loginCompleted = true;
+                    const sessionPackage = {
+                        id: sessionId,
+                        user: sock.user.id,
+                        timestamp: Date.now(),
+                        files: sessionFiles
+                    };
                     
-                    // ✅ STEP 1: Force save credentials immediately
-                    console.log(`💾 [${sessionId}] Forcing credentials save...`);
-                    await saveCreds();
+                    // Encrypt session
+                    console.log(`🔐 [${sessionId}] Encrypting session...`);
+                    const sessionString = encryptSession(sessionPackage, sessionId);
                     
-                    // ✅ STEP 2: Wait 4 seconds for files to fully write on Render
-                    console.log(`⏳ [${sessionId}] Waiting 4 seconds for files to stabilize on Render...`);
-                    await delay(4000);
-                    
-                    try {
-                        // Collect session files
-                        console.log(`📁 [${sessionId}] Collecting session files...`);
-                        const sessionFiles = collectSessionFiles(sessionDir);
+                    // ✅ RETURN SESSION VIA API (faster + reliable)
+                    if (!apiResponseSent) {
+                        // Send session string via WhatsApp
+                        console.log(`📤 [${sessionId}] Sending session via WhatsApp...`);
+                        const userJid = sock.user.id;
                         
-                        const sessionPackage = {
-                            id: sessionId,
-                            user: sock.user.id,
-                            timestamp: Date.now(),
-                            files: sessionFiles
-                        };
+                        await sock.sendMessage(userJid, {
+                            text: `🔐 *GLE Session String*\n\nCopy this entire string for session restore:\n\n\`${sessionString}\``
+                        });
+                        console.log(`✅ [${sessionId}] Session string sent to user`);
                         
-                        // Encrypt session
-                        console.log(`🔐 [${sessionId}] Encrypting session...`);
-                        const sessionString = encryptSession(sessionPackage, sessionId);
-                        
-                        // ✅ RETURN SESSION VIA API (faster + reliable)
-                        if (!apiResponseSent) {
-                            // Send session string via WhatsApp
-                            console.log(`📤 [${sessionId}] Sending session via WhatsApp...`);
-                            const userJid = sock.user.id;
-                            
+                        // Send creds.json
+                        const credsPath = path.join(sessionDir, 'creds.json');
+                        if (fs.existsSync(credsPath)) {
                             await sock.sendMessage(userJid, {
-                                text: `🔐 *GLE Session String*\n\nCopy this entire string for session restore:\n\n\`${sessionString}\``
+                                document: fs.readFileSync(credsPath),
+                                mimetype: 'application/json',
+                                fileName: 'creds.json',
+                                caption: '📁 Your WhatsApp session credentials file'
                             });
-                            console.log(`✅ [${sessionId}] Session string sent to user`);
-                            
-                            // Send creds.json
-                            const credsPath = path.join(sessionDir, 'creds.json');
-                            if (fs.existsSync(credsPath)) {
-                                await sock.sendMessage(userJid, {
-                                    document: fs.readFileSync(credsPath),
-                                    mimetype: 'application/json',
-                                    fileName: 'creds.json',
-                                    caption: '📁 Your WhatsApp session credentials file'
-                                });
-                                console.log(`✅ [${sessionId}] creds.json sent to user`);
-                            }
-                            
-                            await sock.sendMessage(userJid, {
-                                text: `✅ *Login Complete!*\n\nSession saved and sent. The linker will now close.`
-                            });
-                            
-                            apiResponseSent = true;
+                            console.log(`✅ [${sessionId}] creds.json sent to user`);
                         }
                         
-                        // ✅ MEGA UPLOAD IN BACKGROUND (non-blocking)
-                        (async () => {
-                            try {
-                                console.log(`☁️ [${sessionId}] Background Mega upload started...`);
-                                const megaUrl = await uploadSession(sessionString, sessionId);
-                                if (megaUrl && !megaUrl.startsWith('local://')) {
-                                    console.log(`✅ [${sessionId}] Background Mega upload complete`);
-                                    
-                                    // Try to send Mega link if still connected
-                                    try {
-                                        await sock.sendMessage(sock.user.id, {
-                                            text: `💾 *Mega Backup*\n\n${megaUrl}`
-                                        });
-                                        console.log(`✅ [${sessionId}] Mega link sent`);
-                                    } catch (e) {
-                                        console.log(`⚠️ [${sessionId}] Could not send Mega link: ${e.message}`);
-                                    }
-                                }
-                            } catch (e) {
-                                console.log(`⚠️ [${sessionId}] Background Mega upload failed: ${e.message}`);
-                            }
-                        })();
+                        await sock.sendMessage(userJid, {
+                            text: `✅ *Login Complete!*\n\nSession saved and sent. The linker will now close.`
+                        });
                         
-                        // ✅ CLEANUP - Close socket after delay
-                        setTimeout(() => {
-                            console.log(`🔌 [${sessionId}] Closing session socket...`);
-                            sock.ws?.close();
-                            
-                            // Final cleanup
-                            setTimeout(() => {
-                                activeSessions.delete(sessionId);
-                                removeFile(sessionDir);
-                                console.log(`🧹 [${sessionId}] Session cleanup complete - server continues running`);
-                            }, 5000);
-                        }, 5000);
-                        
-                    } catch (err) {
-                        console.error(`❌ [${sessionId}] Session processing failed:`, err);
-                        
-                        // Try to notify user
-                        try {
-                            await sock.sendMessage(sock.user.id, {
-                                text: `❌ *Error*\n\n${err.message}\nPlease try again.`
-                            });
-                        } catch (e) {}
-                        
-                        // Cleanup
-                        sock.ws?.close();
-                        activeSessions.delete(sessionId);
-                        removeFile(sessionDir);
+                        apiResponseSent = true;
                     }
-                } else {
-                    console.log(`⏳ [${sessionId}] Early connection, waiting for restart...`);
+                    
+                    // ✅ MEGA UPLOAD IN BACKGROUND (non-blocking)
+                    (async () => {
+                        try {
+                            console.log(`☁️ [${sessionId}] Background Mega upload started...`);
+                            const megaUrl = await uploadSession(sessionString, sessionId);
+                            if (megaUrl && !megaUrl.startsWith('local://')) {
+                                console.log(`✅ [${sessionId}] Background Mega upload complete`);
+                                
+                                // Try to send Mega link if still connected
+                                try {
+                                    await sock.sendMessage(sock.user.id, {
+                                        text: `💾 *Mega Backup*\n\n${megaUrl}`
+                                    });
+                                    console.log(`✅ [${sessionId}] Mega link sent`);
+                                } catch (e) {
+                                    console.log(`⚠️ [${sessionId}] Could not send Mega link: ${e.message}`);
+                                }
+                            }
+                        } catch (e) {
+                            console.log(`⚠️ [${sessionId}] Background Mega upload failed: ${e.message}`);
+                        }
+                    })();
+                    
+                    // ✅ CLEANUP - Close socket after delay
+                    setTimeout(() => {
+                        console.log(`🔌 [${sessionId}] Closing session socket...`);
+                        sock.ws?.close();
+                        
+                        // Final cleanup
+                        setTimeout(() => {
+                            activeSessions.delete(sessionId);
+                            removeFile(sessionDir);
+                            console.log(`🧹 [${sessionId}] Session cleanup complete - server continues running`);
+                        }, 5000);
+                    }, 5000);
+                    
+                } catch (err) {
+                    console.error(`❌ [${sessionId}] Session processing failed:`, err);
+                    
+                    // Try to notify user
+                    try {
+                        await sock.sendMessage(sock.user.id, {
+                            text: `❌ *Error*\n\n${err.message}\nPlease try again.`
+                        });
+                    } catch (e) {}
+                    
+                    // Cleanup
+                    sock.ws?.close();
+                    activeSessions.delete(sessionId);
+                    removeFile(sessionDir);
                 }
             }
         });
