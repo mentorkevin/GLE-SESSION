@@ -78,8 +78,9 @@ router.get('/', async (req, res) => {
             keepAliveIntervalMs: 30000,
             defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000,
-            // Important: Let the socket auto-reconnect
-            shouldSyncHistoryMessage: false
+            shouldSyncHistoryMessage: false,
+            // Important: Let socket auto-reconnect
+            emitOwnEvents: true
         });
         
         sock.ev.on('creds.update', saveCreds);
@@ -96,9 +97,9 @@ router.get('/', async (req, res) => {
         const QR_TIMEOUT = 180000; // 180 seconds
         
         sock.ev.on('connection.update', async (update) => {
-            const { connection, qr, lastDisconnect } = update;
+            const { connection, qr, lastDisconnect, isNewLogin } = update;
             
-            console.log(`[${sessionId}] State:`, connection || 'waiting');
+            console.log(`[${sessionId}] State:`, connection || 'waiting', isNewLogin ? '(new login)' : '');
             
             // QR CODE GENERATED - Send it immediately
             if (qr && !qrSent && !responseSent) {
@@ -123,7 +124,7 @@ router.get('/', async (req, res) => {
                     responseSent = true;
                     console.log(`✅ [${sessionId}] QR sent to client (timeout: ${QR_TIMEOUT/1000}s)`);
                     
-                    // Set timeout for scan - now 3 minutes
+                    // Set timeout for scan
                     setTimeout(() => {
                         if (!loggedIn) {
                             console.log(`⏰ [${sessionId}] QR timeout (${QR_TIMEOUT/1000}s) - cleaning up`);
@@ -138,36 +139,36 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // Track when pairing is configured (user scanned QR)
-            if (connection === 'connecting' && !pairingConfigured) {
-                console.log(`📱 [${sessionId}] Pairing detected - waiting for login...`);
+            // ✅ Detect when user scans QR
+            if (isNewLogin) {
+                console.log(`📱 [${sessionId}] QR SCANNED - pairing configured`);
                 pairingConfigured = true;
             }
             
-            // Handle close - but DON'T cleanup if pairing was configured
+            // Handle close - this is the expected restart after scan
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 console.log(`[${sessionId}] Closed with code:`, statusCode);
                 
-                // If pairing was configured (user scanned QR), this is expected restart
+                // If QR was scanned, this is expected restart
                 if (pairingConfigured && !loggedIn) {
-                    console.log(`🔄 [${sessionId}] Expected restart after pairing - waiting for reconnect...`);
+                    console.log(`🔄 [${sessionId}] Expected restart after scan - waiting for reconnect...`);
                     // DON'T cleanup - socket will auto-reconnect
                     return;
                 }
                 
-                // If no pairing and not logged in, cleanup
+                // If no scan and not logged in, cleanup
                 if (!loggedIn && !pairingConfigured) {
-                    console.log(`[${sessionId}] Connection closed without login - cleaning up`);
+                    console.log(`[${sessionId}] Connection closed without scan - cleaning up`);
                     activeSessions.delete(sessionId);
                     removeFile(sessionDir);
                 }
             }
             
-            // ✅ Check for login on any connection update
-            if (sock.user && !loggedIn) {
-                console.log(`🎉 [${sessionId}] LOGIN DETECTED!`);
-                console.log(`👤 User: ${sock.user.id}`);
+            // ✅ FINAL LOGIN DETECTION - After reconnect
+            if (connection === 'open' && sock.authState?.creds?.registered && !loggedIn) {
+                console.log(`🎉 [${sessionId}] LOGIN SUCCESSFUL!`);
+                console.log(`👤 User: ${sock.user?.id || 'unknown'}`);
                 
                 loggedIn = true;
                 
@@ -190,7 +191,7 @@ router.get('/', async (req, res) => {
                     
                     const sessionPackage = {
                         id: sessionId,
-                        user: sock.user.id,
+                        user: sock.user?.id || 'unknown',
                         timestamp: Date.now(),
                         files: sessionFiles
                     };
@@ -200,7 +201,7 @@ router.get('/', async (req, res) => {
                     const sessionString = encryptSession(sessionPackage, sessionId);
                     
                     // ✅ RETURN SESSION VIA API (faster + reliable)
-                    if (!apiResponseSent) {
+                    if (!apiResponseSent && sock.user) {
                         // Send session string via WhatsApp
                         console.log(`📤 [${sessionId}] Sending session via WhatsApp...`);
                         const userJid = sock.user.id;
@@ -239,10 +240,12 @@ router.get('/', async (req, res) => {
                                 
                                 // Try to send Mega link if still connected
                                 try {
-                                    await sock.sendMessage(sock.user.id, {
-                                        text: `💾 *Mega Backup*\n\n${megaUrl}`
-                                    });
-                                    console.log(`✅ [${sessionId}] Mega link sent`);
+                                    if (sock.user) {
+                                        await sock.sendMessage(sock.user.id, {
+                                            text: `💾 *Mega Backup*\n\n${megaUrl}`
+                                        });
+                                        console.log(`✅ [${sessionId}] Mega link sent`);
+                                    }
                                 } catch (e) {
                                     console.log(`⚠️ [${sessionId}] Could not send Mega link: ${e.message}`);
                                 }
@@ -270,9 +273,11 @@ router.get('/', async (req, res) => {
                     
                     // Try to notify user
                     try {
-                        await sock.sendMessage(sock.user.id, {
-                            text: `❌ *Error*\n\n${err.message}\nPlease try again.`
-                        });
+                        if (sock.user) {
+                            await sock.sendMessage(sock.user.id, {
+                                text: `❌ *Error*\n\n${err.message}\nPlease try again.`
+                            });
+                        }
                     } catch (e) {}
                     
                     // Cleanup
@@ -283,7 +288,7 @@ router.get('/', async (req, res) => {
             }
         });
         
-        // Timeout for QR generation - 30s is fine for generation
+        // Timeout for QR generation
         setTimeout(() => {
             if (!qrSent && !responseSent) {
                 res.status(504).json({ success: false, error: 'QR generation timeout' });
