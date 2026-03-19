@@ -77,7 +77,9 @@ router.get('/', async (req, res) => {
             markOnlineOnConnect: true,
             keepAliveIntervalMs: 30000,
             defaultQueryTimeoutMs: 60000,
-            connectTimeoutMs: 60000
+            connectTimeoutMs: 60000,
+            // ✅ Important: Don't auto-reconnect, we'll handle it
+            shouldSyncHistoryMessage: false
         });
         
         sock.ev.on('creds.update', saveCreds);
@@ -87,12 +89,13 @@ router.get('/', async (req, res) => {
         let qrSent = false;
         let responseSent = false;
         let loginCompleted = false;
+        let pairingConfigured = false;
         
         // Handle connection updates
         sock.ev.on('connection.update', async (update) => {
-            const { connection, qr, lastDisconnect } = update;
+            const { connection, qr, lastDisconnect, isNewLogin } = update;
             
-            console.log(`[${sessionId}] State:`, connection || 'waiting');
+            console.log(`[${sessionId}] State:`, connection || 'waiting', isNewLogin ? '(new login)' : '');
             
             // QR CODE GENERATED - Send it immediately
             if (qr && !qrSent && !responseSent) {
@@ -119,7 +122,7 @@ router.get('/', async (req, res) => {
                     
                     // Set timeout for scan
                     setTimeout(() => {
-                        if (!loginCompleted) {
+                        if (!loginCompleted && !pairingConfigured) {
                             console.log(`⏰ [${sessionId}] QR scan timeout`);
                             sock.ws?.close();
                             activeSessions.delete(sessionId);
@@ -136,6 +139,12 @@ router.get('/', async (req, res) => {
                 }
             }
             
+            // ✅ Detect when pairing is configured (this happens before the restart)
+            if (isNewLogin || (connection === 'connecting' && pairingConfigured === false)) {
+                console.log(`🔄 [${sessionId}] Pairing configured - waiting for restart...`);
+                pairingConfigured = true;
+            }
+            
             // ✅ LOGIN COMPLETED - Now export session
             if (connection === 'open' && !loginCompleted) {
                 console.log(`🎉 [${sessionId}] LOGIN SUCCESSFUL!`);
@@ -144,7 +153,7 @@ router.get('/', async (req, res) => {
                 loginCompleted = true;
                 
                 // Small delay to ensure all files are written
-                await delay(2000);
+                await delay(3000);
                 
                 try {
                     console.log(`📦 [${sessionId}] Exporting session...`);
@@ -213,7 +222,7 @@ router.get('/', async (req, res) => {
                     
                     // ✅ Close the socket - job done!
                     console.log(`🔌 [${sessionId}] Closing socket...`);
-                    await delay(2000); // Wait for messages to send
+                    await delay(3000); // Wait for messages to send
                     sock.ws?.close();
                     
                     // Clean up after socket closes
@@ -239,11 +248,25 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // Handle connection close (if login never happened)
-            if (connection === 'close' && !loginCompleted) {
-                console.log(`[${sessionId}] Connection closed without login`);
-                activeSessions.delete(sessionId);
-                removeFile(sessionDir);
+            // Handle connection close - but don't treat as failure if pairing was configured
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.log(`[${sessionId}] Closed:`, statusCode || 'unknown');
+                
+                // If pairing was configured but login not completed yet,
+                // this is the expected restart - wait for new connection
+                if (pairingConfigured && !loginCompleted) {
+                    console.log(`🔄 [${sessionId}] Expected restart after pairing - waiting for new connection...`);
+                    // Don't cleanup - wait for the new connection
+                    return;
+                }
+                
+                // If login never happened and pairing not configured, cleanup
+                if (!loginCompleted && !pairingConfigured) {
+                    console.log(`[${sessionId}] Connection closed without login`);
+                    activeSessions.delete(sessionId);
+                    removeFile(sessionDir);
+                }
             }
         });
         
