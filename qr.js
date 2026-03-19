@@ -1,6 +1,5 @@
 import express from 'express';
 import fs from 'fs';
-import pino from 'pino';
 import { makeWASocket, useMultiFileAuthState, delay, Browsers, fetchLatestBaileysVersion, jidNormalizedUser, DisconnectReason } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import path from 'path';
@@ -38,48 +37,48 @@ router.get('/', async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const { version } = await fetchLatestBaileysVersion();
         
-        // FIX 1: Proper socket configuration
+        // Create socket
         const sock = makeWASocket({
             version,
             auth: state,
             printQRInTerminal: true,
-            browser: Browsers.windows("Chrome"), // ✅ FIXED: Use proper browser config
+            browser: Browsers.windows("Chrome"),
             syncFullHistory: false,
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000, // ✅ FIXED: Keep connection alive
+            keepAliveIntervalMs: 30000,
             defaultQueryTimeoutMs: 60000,
-            connectTimeoutMs: 60000, // ✅ FIXED: Add connection timeout
+            connectTimeoutMs: 60000,
             generateHighQualityLinkPreview: false,
-            patchMessageBeforeSending: true // ✅ FIXED: Fix 408 errors
+            patchMessageBeforeSending: true
         });
         
         sock.ev.on('creds.update', saveCreds);
         
-        // Store session
         activeSessions.set(sessionId, { sock, sessionDir, status: 'waiting', connected: false });
         
         let qrSent = false;
         let connected = false;
         let responseSent = false;
+        let loginCompleted = false;
         
-        // FIX 2: Proper connection lifecycle handling
+        // Handle connection updates
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
             
             console.log(`[${sessionId}] State:`, connection || 'waiting');
             
-            // QR CODE GENERATED
+            // ✅ QR CODE GENERATED - Send it immediately
             if (qr && !qrSent && !responseSent) {
                 qrSent = true;
                 try {
                     const qrImage = await QRCode.toDataURL(qr);
                     
-                    // ✅ FIX: Send response but KEEP CONNECTION ALIVE
+                    // Send response immediately with QR
                     res.json({ 
                         success: true, 
                         qr: qrImage, 
                         sessionId,
-                        message: 'Scan with WhatsApp - connection will stay alive',
+                        message: 'Scan with WhatsApp',
                         instructions: [
                             '1. Open WhatsApp on your phone',
                             '2. Tap Menu or Settings and select Linked Devices',
@@ -88,11 +87,11 @@ router.get('/', async (req, res) => {
                         ]
                     });
                     responseSent = true;
-                    console.log(`✅ [${sessionId}] QR sent to client - waiting for scan...`);
+                    console.log(`✅ [${sessionId}] QR sent to client`);
                     
                     // Set timeout for scan (3 minutes)
                     setTimeout(() => {
-                        if (!connected) {
+                        if (!connected && !loginCompleted) {
                             console.log(`⏰ [${sessionId}] QR scan timeout`);
                             sock.ws?.close();
                             activeSessions.delete(sessionId);
@@ -109,56 +108,40 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // ✅ FIX 3: CRITICAL - Wait for 'open' state before considering connected
+            // ✅ LOGIN COMPLETED - Now do everything else
             if (connection === 'open') {
-                connected = true;
-                console.log(`🎉 [${sessionId}] WHATSAPP CONNECTED!`);
+                console.log(`🎉 [${sessionId}] LOGIN SUCCESSFUL!`);
                 console.log(`👤 User: ${sock.user?.id}`);
                 
-                // ✅ FIX 4: ONLY save session after 'open' state
-                // Save session ID for future restore
+                connected = true;
+                loginCompleted = true;
+                
+                // ✅ Save session ID for potential restore
                 fs.writeFileSync(ACTIVE_SESSION_FILE, sessionId);
+                console.log(`✅ [${sessionId}] Session ID saved`);
                 
                 // Send confirmation to user
                 try {
                     await sock.sendMessage(sock.user.id, {
-                        text: `✅ *WhatsApp Connected Successfully!*\n\nSession ID: ${sessionId}`
+                        text: `✅ *WhatsApp Linked Successfully!*\n\nSession ID: ${sessionId}`
                     });
                     console.log(`✅ [${sessionId}] Confirmation sent`);
                 } catch (msgErr) {
                     console.error(`Failed to send confirmation:`, msgErr);
                 }
                 
-                // Keep socket alive - don't close
+                console.log(`✅ [${sessionId}] Post-login tasks completed`);
             }
             
-            // ✅ FIX 5: Handle connection close with reconnection logic
+            // Handle connection close
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                console.log(`[${sessionId}] Closed:`, statusCode);
                 
-                console.log(`[${sessionId}] Closed:`, { statusCode, shouldReconnect });
-                
-                // If we were connected, try to reconnect
-                if (connected && shouldReconnect) {
-                    console.log(`🔄 [${sessionId}] Reconnecting in 5 seconds...`);
-                    // Don't delete session - let it reconnect
-                    return;
-                }
-                
-                // Only cleanup if not connected or logged out
-                if (!connected || !shouldReconnect) {
+                // If login never completed and QR was sent, just cleanup
+                if (!loginCompleted) {
                     activeSessions.delete(sessionId);
                     removeFile(sessionDir);
-                }
-                
-                // If QR was sent but never scanned, error response already sent
-                if (!connected && !responseSent) {
-                    res.status(500).json({ 
-                        success: false, 
-                        error: `Connection failed: ${statusCode || 'unknown'}` 
-                    });
-                    responseSent = true;
                 }
             }
         });
