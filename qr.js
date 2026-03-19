@@ -79,7 +79,6 @@ router.get('/', async (req, res) => {
             defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000,
             shouldSyncHistoryMessage: false,
-            // Important: Let socket auto-reconnect
             emitOwnEvents: true
         });
         
@@ -92,9 +91,12 @@ router.get('/', async (req, res) => {
         let loggedIn = false;
         let apiResponseSent = false;
         let pairingConfigured = false;
+        let reconnectTimer = null;
         
         // ✅ INCREASED QR TIMEOUT: 3 minutes (180 seconds)
         const QR_TIMEOUT = 180000; // 180 seconds
+        // ✅ Reconnect timeout: 30 seconds
+        const RECONNECT_TIMEOUT = 30000; // 30 seconds
         
         sock.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect, isNewLogin } = update;
@@ -126,7 +128,7 @@ router.get('/', async (req, res) => {
                     
                     // Set timeout for scan
                     setTimeout(() => {
-                        if (!loggedIn) {
+                        if (!loggedIn && !pairingConfigured) {
                             console.log(`⏰ [${sessionId}] QR timeout (${QR_TIMEOUT/1000}s) - cleaning up`);
                             sock.ws?.close();
                             activeSessions.delete(sessionId);
@@ -153,8 +155,19 @@ router.get('/', async (req, res) => {
                 // If QR was scanned, this is expected restart
                 if (pairingConfigured && !loggedIn) {
                     console.log(`🔄 [${sessionId}] Expected restart after scan - waiting for reconnect...`);
-                    // DON'T cleanup - socket will auto-reconnect
-                    return;
+                    
+                    // Set a timeout for reconnect
+                    if (reconnectTimer) clearTimeout(reconnectTimer);
+                    reconnectTimer = setTimeout(() => {
+                        if (!loggedIn) {
+                            console.log(`⏰ [${sessionId}] Reconnect timeout (${RECONNECT_TIMEOUT/1000}s) - cleaning up`);
+                            sock.ws?.close();
+                            activeSessions.delete(sessionId);
+                            removeFile(sessionDir);
+                        }
+                    }, RECONNECT_TIMEOUT);
+                    
+                    return; // DON'T cleanup
                 }
                 
                 // If no scan and not logged in, cleanup
@@ -169,6 +182,12 @@ router.get('/', async (req, res) => {
             if (connection === 'open' && sock.authState?.creds?.registered && !loggedIn) {
                 console.log(`🎉 [${sessionId}] LOGIN SUCCESSFUL!`);
                 console.log(`👤 User: ${sock.user?.id || 'unknown'}`);
+                
+                // Clear reconnect timeout
+                if (reconnectTimer) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
                 
                 loggedIn = true;
                 
