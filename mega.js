@@ -9,51 +9,73 @@ dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Mega credentials
+// Try multiple auth methods
+const MEGA_EMAIL = process.env.MEGA_EMAIL;
+const MEGA_PASSWORD = process.env.MEGA_PASSWORD;
 const MEGA_SESSION = process.env.MEGA_SESSION;
 
 let storage = null;
 let connectionAttempts = 0;
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 2;
 
-// Authenticate with Mega
 async function authenticate() {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         try {
-            if (!MEGA_SESSION) {
-                console.warn('⚠️ No Mega credentials found - Mega features disabled');
+            // Check for any credentials
+            if (!MEGA_EMAIL && !MEGA_PASSWORD && !MEGA_SESSION) {
+                console.log('📦 Mega: DISABLED (no credentials)');
                 resolve(null);
                 return;
             }
 
             console.log('🔄 Connecting to Mega...');
 
-            const options = { session: MEGA_SESSION };
+            // Prepare auth options
+            const options = {};
             
+            if (MEGA_EMAIL && MEGA_PASSWORD) {
+                options.email = MEGA_EMAIL;
+                options.password = MEGA_PASSWORD;
+                console.log('📧 Using email/password auth');
+            } else if (MEGA_SESSION) {
+                options.session = MEGA_SESSION;
+                console.log('🔑 Using session token auth');
+            }
+
             storage = new Mega.Storage(options);
             
+            // Set timeout for connection
+            const timeout = setTimeout(() => {
+                console.log('⏰ Mega connection timeout - continuing without Mega');
+                storage = null;
+                resolve(null);
+            }, 10000);
+
             storage.on('ready', () => {
-                console.log('✅ Connected to Mega');
+                clearTimeout(timeout);
+                console.log('✅ Mega connected');
                 connectionAttempts = 0;
                 resolve(storage);
             });
 
             storage.on('error', (err) => {
-                console.error('❌ Mega connection error:', err.message);
+                clearTimeout(timeout);
+                console.error('❌ Mega error:', err.message);
                 
                 connectionAttempts++;
                 if (connectionAttempts < MAX_ATTEMPTS) {
-                    console.log(`🔄 Retrying Mega connection (${connectionAttempts}/${MAX_ATTEMPTS})...`);
-                    setTimeout(() => authenticate().then(resolve).catch(reject), 5000);
+                    console.log(`🔄 Retrying (${connectionAttempts}/${MAX_ATTEMPTS})...`);
+                    setTimeout(() => authenticate().then(resolve), 5000);
                 } else {
-                    console.warn('⚠️ Mega connection failed - continuing without Mega');
+                    console.log('📦 Mega: DISABLED (connection failed)');
                     storage = null;
                     resolve(null);
                 }
             });
 
         } catch (err) {
-            console.error('❌ Mega auth error:', err.message);
+            console.log('📦 Mega: DISABLED (error)');
+            storage = null;
             resolve(null);
         }
     });
@@ -77,8 +99,6 @@ export const uploadSession = async (sessionString, sessionId) => {
         const buffer = Buffer.from(sessionString);
         const stream = Readable.from(buffer);
         
-        console.log(`📤 Uploading ${filename}...`);
-        
         return new Promise((resolve) => {
             const uploadStream = storage.upload({
                 name: filename,
@@ -87,18 +107,20 @@ export const uploadSession = async (sessionString, sessionId) => {
 
             stream.pipe(uploadStream);
 
+            const timeout = setTimeout(() => {
+                resolve(`local://session/${sessionId}`);
+            }, 15000);
+
             uploadStream.on('complete', (file) => {
+                clearTimeout(timeout);
                 file.link((err, url) => {
-                    if (err) {
-                        resolve(`local://session/${sessionId}`);
-                    } else {
-                        console.log(`✅ Upload complete`);
-                        resolve(url);
-                    }
+                    if (err) resolve(`local://session/${sessionId}`);
+                    else resolve(url);
                 });
             });
 
             uploadStream.on('error', () => {
+                clearTimeout(timeout);
                 resolve(`local://session/${sessionId}`);
             });
         });
@@ -109,12 +131,10 @@ export const uploadSession = async (sessionString, sessionId) => {
 
 export const downloadSession = async (identifier) => {
     try {
-        if (typeof identifier === 'string' && identifier.startsWith('local://')) {
+        if (identifier?.startsWith?.('local://')) {
             throw new Error('Local session');
         }
 
-        console.log(`📥 Downloading from Mega...`);
-        
         const file = Mega.File.fromURL(identifier);
         
         return new Promise((resolve, reject) => {
@@ -125,15 +145,11 @@ export const downloadSession = async (identifier) => {
                 }
 
                 file.download((err, data) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        console.log(`✅ Download complete`);
-                        resolve({
-                            data: data.toString(),
-                            filename: file.name
-                        });
-                    }
+                    if (err) reject(err);
+                    else resolve({
+                        data: data.toString(),
+                        filename: file.name
+                    });
                 });
             });
         });
@@ -143,12 +159,8 @@ export const downloadSession = async (identifier) => {
 };
 
 export const testConnection = async () => {
-    try {
-        const storage = await getStorage();
-        return { success: !!storage };
-    } catch (err) {
-        return { success: false, error: err.message };
-    }
+    const storage = await getStorage();
+    return { success: !!storage };
 };
 
 export default {
