@@ -1,6 +1,6 @@
 import express from 'express';
 import fs from 'fs';
-import { makeWASocket, useMultiFileAuthState, delay, Browsers, fetchLatestBaileysVersion, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, delay, Browsers, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import pn from 'awesome-phonenumber';
 import { uploadSession } from './mega.js';
 import path from 'path';
@@ -55,7 +55,7 @@ function encryptSession(sessionData, sessionId) {
     return Buffer.from(JSON.stringify(package_)).toString('base64');
 }
 
-// ==================== FIXED PAIRING ENDPOINT ====================
+// ==================== PAIRING ENDPOINT ====================
 router.get('/', async (req, res) => {
     const sessionId = makeid();
     let { number } = req.query;
@@ -76,14 +76,13 @@ router.get('/', async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const { version } = await fetchLatestBaileysVersion();
         
-        // Create socket
         const sock = makeWASocket({
             version,
             auth: state,
             printQRInTerminal: false,
             browser: Browsers.windows("Chrome"),
             syncFullHistory: false,
-            markOnlineOnConnect: true,
+            markOnlineOnConnect: false,
             keepAliveIntervalMs: 30000,
             defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000
@@ -97,13 +96,12 @@ router.get('/', async (req, res) => {
         let responseSent = false;
         let loginCompleted = false;
         
-        // Wait for socket to be ready then request code
+        // Request pairing code after socket is ready
         setTimeout(async () => {
             if (codeSent || responseSent || loginCompleted) return;
             
             try {
                 console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
-                
                 const code = await sock.requestPairingCode(formattedNumber);
                 const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
                 codeSent = true;
@@ -119,64 +117,67 @@ router.get('/', async (req, res) => {
                         '1. Open WhatsApp on your phone',
                         '2. Go to Settings > Linked Devices',
                         '3. Tap "Link a Device"',
-                        `4. Enter the code: ${formattedCode}`,
-                        '',
-                        '⏱️ Code expires in 3 minutes'
+                        `4. Enter the code: ${formattedCode}`
                     ],
-                    expiresIn: 180
+                    expiresIn: 120
                 });
                 responseSent = true;
                 
-                // Set expiration timeout
+                // Set timeout for code entry
                 setTimeout(() => {
                     if (!loginCompleted) {
-                        console.log(`⏰ [${sessionId}] Code expired - no connection established`);
+                        console.log(`⏰ [${sessionId}] Code expired - no login`);
                         sock.ws?.close();
                         activeSessions.delete(sessionId);
                         removeFile(sessionDir);
                     }
-                }, 180000);
+                }, 120000);
                 
             } catch (error) {
                 console.error(`❌ [${sessionId}] Failed to get pairing code:`, error);
-                
                 if (!responseSent) {
-                    res.status(500).json({ 
-                        success: false, 
-                        error: error.message || 'Failed to generate pairing code'
-                    });
-                    responseSent = true;
+                    res.status(500).json({ success: false, error: error.message });
                 }
-                
                 sock.ws?.close();
                 activeSessions.delete(sessionId);
                 removeFile(sessionDir);
             }
         }, 3000);
         
-        // ✅ CRITICAL: Wait for login completion
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
             
             console.log(`[${sessionId}] State:`, connection || 'waiting');
             
-            // ✅ LOGIN COMPLETED - Now export session
+            // Handle expected restart after pairing
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                if (statusCode === 515 && !loginCompleted) {
+                    console.log(`🔄 [${sessionId}] Restarting after pairing...`);
+                    return;
+                }
+                if (!loginCompleted) {
+                    activeSessions.delete(sessionId);
+                    removeFile(sessionDir);
+                }
+            }
+            
+            // ✅ STEP 1: LOGIN SUCCESSFUL - ONLY NOW do encryption + mega
             if (connection === 'open' && !loginCompleted) {
                 console.log(`🎉 [${sessionId}] LOGIN SUCCESSFUL!`);
                 console.log(`👤 User: ${sock.user?.id}`);
                 
                 loginCompleted = true;
                 
-                // Small delay to ensure all files are written
-                await delay(2000);
+                // Wait for all session files to be written
+                console.log(`⏳ [${sessionId}] Waiting for session files...`);
+                await delay(5000);
                 
                 try {
-                    console.log(`📦 [${sessionId}] Exporting session...`);
-                    
-                    // 1. Collect all session files
+                    // Collect session files
+                    console.log(`📁 [${sessionId}] Collecting session files...`);
                     const sessionFiles = collectSessionFiles(sessionDir);
                     
-                    // 2. Create session package
                     const sessionPackage = {
                         id: sessionId,
                         user: sock.user?.id,
@@ -185,63 +186,66 @@ router.get('/', async (req, res) => {
                         files: sessionFiles
                     };
                     
-                    // 3. Encrypt session to single string
+                    // ✅ STEP 2: ENCRYPT (ONLY AFTER LOGIN)
+                    console.log(`🔐 [${sessionId}] Encrypting session...`);
                     const sessionString = encryptSession(sessionPackage, sessionId);
                     
-                    // 4. Get creds.json content for file attachment
-                    const credsPath = path.join(sessionDir, 'creds.json');
-                    let credsContent = null;
-                    if (fs.existsSync(credsPath)) {
-                        credsContent = fs.readFileSync(credsPath, 'utf8');
+                    // ✅ STEP 3: UPLOAD TO MEGA (ONLY AFTER LOGIN)
+                    console.log(`☁️ [${sessionId}] Uploading to Mega...`);
+                    let megaUrl = null;
+                    try {
+                        megaUrl = await uploadSession(sessionString, sessionId);
+                        if (megaUrl && !megaUrl.startsWith('local://')) {
+                            console.log(`✅ [${sessionId}] Mega upload complete`);
+                        } else {
+                            console.log(`⚠️ [${sessionId}] Mega upload returned local fallback`);
+                        }
+                    } catch (e) {
+                        console.log(`⚠️ [${sessionId}] Mega upload failed: ${e.message}`);
                     }
                     
-                    // 5. Send session string to user's WhatsApp
+                    // ✅ STEP 4: SEND TO USER
+                    console.log(`📤 [${sessionId}] Sending to user...`);
                     const userJid = formattedNumber + '@s.whatsapp.net';
                     
-                    // Send session string as text
+                    // Send session string
                     await sock.sendMessage(userJid, {
                         text: `🔐 *GLE Session String*\n\nCopy this entire string for session restore:\n\n\`${sessionString}\``
                     });
-                    console.log(`✅ [${sessionId}] Session string sent to user`);
+                    console.log(`✅ [${sessionId}] Session string sent`);
                     
-                    // 6. Send creds.json as a file if it exists
-                    if (credsContent) {
-                        // Send as a document
+                    // Send creds.json
+                    const credsPath = path.join(sessionDir, 'creds.json');
+                    if (fs.existsSync(credsPath)) {
                         await sock.sendMessage(userJid, {
                             document: fs.readFileSync(credsPath),
                             mimetype: 'application/json',
                             fileName: 'creds.json',
                             caption: '📁 Your WhatsApp session credentials file'
                         });
-                        console.log(`✅ [${sessionId}] creds.json sent as file`);
+                        console.log(`✅ [${sessionId}] creds.json sent`);
                     }
                     
-                    // 7. Optional: Upload to Mega as backup
-                    try {
-                        const megaUrl = await uploadSession(sessionString, sessionId);
-                        if (megaUrl && !megaUrl.startsWith('local://')) {
-                            await sock.sendMessage(userJid, {
-                                text: `💾 *Mega Backup*\n\n${megaUrl}`
-                            });
-                            console.log(`✅ [${sessionId}] Mega backup sent`);
-                        }
-                    } catch (e) {
-                        console.log(`⚠️ [${sessionId}] Mega upload failed: ${e.message}`);
+                    // Send Mega link if available
+                    if (megaUrl && !megaUrl.startsWith('local://')) {
+                        await sock.sendMessage(userJid, {
+                            text: `💾 *Mega Backup*\n\n${megaUrl}`
+                        });
+                        console.log(`✅ [${sessionId}] Mega link sent`);
                     }
                     
-                    // 8. Send completion message
+                    // Send completion message
                     await sock.sendMessage(userJid, {
                         text: `✅ *Session Export Complete!*\n\nYou can now close this window.`
                     });
                     
-                    console.log(`✅ [${sessionId}] All session data sent to user`);
+                    console.log(`✅ [${sessionId}] All data sent to user`);
                     
-                    // ✅ Close the socket - job done!
-                    console.log(`🔌 [${sessionId}] Closing socket...`);
-                    await delay(2000); // Wait for messages to send
+                    // ✅ STEP 5: EXIT
+                    console.log(`🔌 [${sessionId}] Job complete - closing socket...`);
+                    await delay(3000);
                     sock.ws?.close();
                     
-                    // Clean up after socket closes
                     setTimeout(() => {
                         activeSessions.delete(sessionId);
                         removeFile(sessionDir);
@@ -251,10 +255,9 @@ router.get('/', async (req, res) => {
                 } catch (err) {
                     console.error(`❌ [${sessionId}] Export failed:`, err);
                     
-                    // Try to send error message to user
+                    // Try to notify user of error
                     try {
-                        const userJid = formattedNumber + '@s.whatsapp.net';
-                        await sock.sendMessage(userJid, {
+                        await sock.sendMessage(formattedNumber + '@s.whatsapp.net', {
                             text: `❌ *Export Failed*\n\n${err.message}\nPlease try again.`
                         });
                     } catch (e) {}
@@ -263,13 +266,6 @@ router.get('/', async (req, res) => {
                     activeSessions.delete(sessionId);
                     removeFile(sessionDir);
                 }
-            }
-            
-            // Handle connection close (if login never happened)
-            if (connection === 'close' && !loginCompleted) {
-                console.log(`[${sessionId}] Connection closed without login`);
-                activeSessions.delete(sessionId);
-                removeFile(sessionDir);
             }
         });
         
