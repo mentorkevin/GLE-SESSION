@@ -22,11 +22,12 @@ const __dirname = path.dirname(__filename);
 const PORT = process.env.PORT || 8000;
 const SESSION_ID_FILE = path.join(__dirname, '.active_session');
 
+// Increase event listeners for WebSocket
+import('events').then(events => {
+    events.EventEmitter.defaultMaxListeners = 500;
+});
+
 // ==================== AUTO-RESTORE ON STARTUP ====================
-/**
- * This is for Render deployment:
- * - When Render restarts, we try to restore any existing session
- */
 async function initializeBot() {
     console.log('\n🚀 [INIT] Starting GLE initialization...');
     
@@ -42,59 +43,43 @@ async function initializeBot() {
         
         // Test Mega connection
         console.log(`🔍 [INIT] Testing Mega connection...`);
-        const megaStatus = await testConnection();
-        if (!megaStatus.success) {
-            console.warn(`⚠️ [INIT] Mega connection failed: ${megaStatus.error}`);
-        } else {
-            console.log(`✅ [INIT] Mega connection successful`);
+        try {
+            const megaStatus = await testConnection();
+            if (!megaStatus.success) {
+                console.warn(`⚠️ [INIT] Mega connection failed: ${megaStatus.error}`);
+            } else {
+                console.log(`✅ [INIT] Mega connection successful`);
+            }
+        } catch (megaError) {
+            console.warn(`⚠️ [INIT] Mega test error: ${megaError.message}`);
         }
         
-        // Try to restore session if we have an ID (for persistent sessions)
+        // Try to restore session if we have an ID
         if (activeSessionId) {
             console.log(`🔄 [INIT] Attempting to restore session: ${activeSessionId}`);
-            const restored = await restoreAndStartBot(activeSessionId);
-            
-            if (restored.success) {
-                console.log(`✅ [INIT] Session restored successfully!`);
-                console.log(`👤 [INIT] User: ${restored.userId}`);
-                
-                // Set up connection monitoring
-                const sock = restored.sock;
-                if (sock) {
-                    sock.ev.on('connection.update', (update) => {
-                        const { connection } = update;
-                        if (connection === 'open') {
-                            console.log(`✅ [BOT] Connection open - bot is active`);
-                        }
-                        if (connection === 'close') {
-                            console.log(`🔴 [BOT] Connection closed - will restart on next request`);
-                            // Don't try to reconnect automatically, just log
-                        }
-                    });
+            // Don't await - let it run in background
+            restoreAndStartBot(activeSessionId).then(result => {
+                if (result.success) {
+                    console.log(`✅ [INIT] Session restored successfully!`);
+                    console.log(`👤 [INIT] User: ${result.userId}`);
+                } else {
+                    console.log(`⚠️ [INIT] Failed to restore session: ${result.error}`);
+                    // Clear invalid session ID but DON'T exit
+                    if (fs.existsSync(SESSION_ID_FILE)) {
+                        fs.unlinkSync(SESSION_ID_FILE);
+                    }
                 }
-                
-                return true;
-            } else {
-                console.log(`⚠️ [INIT] Failed to restore session: ${restored.error}`);
-                
-                // Clear invalid session ID
-                if (fs.existsSync(SESSION_ID_FILE)) {
-                    fs.unlinkSync(SESSION_ID_FILE);
-                }
-            }
+            }).catch(err => {
+                console.error(`❌ [INIT] Restore error:`, err);
+            });
         }
         
-        return false;
+        return true;
     } catch (error) {
         console.error(`❌ [INIT] Initialization error:`, error);
-        return false;
+        return true; // Even on error, server stays alive
     }
 }
-
-// Increase event listeners for WebSocket
-import('events').then(events => {
-    events.EventEmitter.defaultMaxListeners = 500;
-});
 
 // Middleware
 app.use(bodyParser.json({ limit: '50mb' }));
@@ -130,45 +115,31 @@ app.get('/status', (req, res) => {
     });
 });
 
+// ==================== PING ENDPOINT ====================
+app.get('/ping', (req, res) => {
+    res.send('pong');
+});
+
 // ==================== WEB INTERFACE ====================
 app.get('/', (req, res) => {
     const htmlPath = path.join(__dirname, 'pair.html');
     
     if (fs.existsSync(htmlPath)) {
+        // Just serve the existing pair.html file
         res.sendFile(htmlPath);
     } else {
-        // Your existing fallback HTML (keeping it as is)
-        res.send(`
-<!DOCTYPE html>
-<html>
-<head>
-    <title>GLE - WhatsApp Linker</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body { font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }
-        .container { background: #f5f5f5; padding: 30px; border-radius: 10px; }
-        h1 { color: #333; }
-        button { background: #25D366; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin: 5px; }
-        #output { margin-top: 20px; padding: 10px; background: white; border-radius: 5px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>GLE - WhatsApp Linker</h1>
-        <p>Server is running on Render!</p>
-        <button onclick="getStatus()">Check Status</button>
-        <button onclick="window.location.href='/qr'">Generate QR</button>
-        <div id="output"></div>
-    </div>
-    <script>
-        async function getStatus() {
-            const res = await fetch('/status');
-            const data = await res.json();
-            document.getElementById('output').innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
-        }
-    </script>
-</body>
-</html>
+        // If pair.html is missing, show error
+        res.status(404).send(`
+            <h1>pair.html not found</h1>
+            <p>The pair.html file is missing. Please ensure it exists in the root directory.</p>
+            <p>Available endpoints:</p>
+            <ul>
+                <li><a href="/qr">/qr</a> - QR Code Login</li>
+                <li><a href="/pair?number=+1234567890">/pair?number=+1234567890</a> - Pairing Code Login</li>
+                <li><a href="/status">/status</a> - Server Status</li>
+                <li><a href="/health">/health</a> - Health Check</li>
+                <li><a href="/ping">/ping</a> - Ping</li>
+            </ul>
         `);
     }
 });
@@ -180,23 +151,37 @@ app.use('/restore', restoreRouter);
 
 // ==================== START SERVER ====================
 const server = app.listen(PORT, '0.0.0.0', async () => {
-    console.log(`\n🎬 [SERVER] GLE starting...`);
+    console.log(`\n🎬 [SERVER] GLE WhatsApp Linker starting...`);
     console.log(`📡 Port: ${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`🔐 Encryption: ${process.env.ENCRYPTION_KEY ? 'enabled' : 'DISABLED'}`);
     console.log(`📦 Mega: ${process.env.MEGA_SESSION ? 'configured' : 'NOT CONFIGURED'}`);
     
-    // Auto-restore session on startup (optional - your code already does this)
-    await initializeBot();
+    // Check if pair.html exists
+    const htmlPath = path.join(__dirname, 'pair.html');
+    if (fs.existsSync(htmlPath)) {
+        console.log(`✅ Found pair.html - will serve as web interface`);
+    } else {
+        console.log(`⚠️ pair.html not found - web interface will show error`);
+    }
+    
+    // Initialize in background
+    initializeBot().then(() => {
+        console.log(`✅ [INIT] Background initialization complete`);
+    }).catch(err => {
+        console.error(`❌ [INIT] Background error:`, err);
+    });
     
     console.log(`\n✅ [SERVER] Ready!`);
-    console.log(`📍 Web Interface: http://localhost:${PORT}/`);
+    console.log(`📍 Web Interface: http://localhost:${PORT}/ (serves pair.html)`);
     console.log(`📍 QR Login: http://localhost:${PORT}/qr`);
     console.log(`📍 Pairing: http://localhost:${PORT}/pair?number=+1234567890`);
     console.log(`📍 Health check: http://localhost:${PORT}/health`);
     console.log(`📍 Status: http://localhost:${PORT}/status`);
+    console.log(`📍 Ping: http://localhost:${PORT}/ping`);
 });
 
+// ==================== KEEP SERVER ALIVE ====================
 // Handle graceful shutdown
 process.on('SIGTERM', () => {
     console.log('📴 [SERVER] Received SIGTERM, shutting down gracefully...');
@@ -205,5 +190,47 @@ process.on('SIGTERM', () => {
         process.exit(0);
     });
 });
+
+process.on('SIGINT', () => {
+    console.log('📴 [SERVER] Received SIGINT, shutting down gracefully...');
+    server.close(() => {
+        console.log('✅ [SERVER] Shutdown complete');
+        process.exit(0);
+    });
+});
+
+// Handle errors - LOG BUT NEVER EXIT
+process.on('uncaughtException', (error) => {
+    console.error('❌ [SERVER] Uncaught Exception:', error);
+    console.log('🔄 [SERVER] Server continues running despite error');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ [SERVER] Unhandled Rejection at:', promise);
+    console.error('📝 [SERVER] Reason:', reason);
+    console.log('🔄 [SERVER] Server continues running despite rejection');
+});
+
+// Keep event loop alive
+process.stdin.resume();
+
+// Self-ping for Render
+if (process.env.RENDER) {
+    const https = require('https');
+    const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    
+    setInterval(() => {
+        const url = `${RENDER_URL}/ping`;
+        https.get(url, (res) => {
+            console.log(`📡 [KEEP-ALIVE] Pinged self at ${new Date().toISOString()}`);
+        }).on('error', (err) => {
+            console.error(`❌ [KEEP-ALIVE] Ping failed:`, err.message);
+        });
+    }, 5 * 60 * 1000);
+    
+    console.log(`📡 [KEEP-ALIVE] Self-ping enabled for Render`);
+}
+
+console.log(`🔴 [SERVER] Process ID: ${process.pid} - Will stay alive indefinitely`);
 
 export default app;
