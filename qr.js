@@ -6,9 +6,19 @@ import { uploadSession } from './mega.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
+import zlib from 'zlib';
 
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Compression and prefix
+const SESSION_PREFIX = 'GleBot::';
+
+function compressAndPrefix(data) {
+    const compressed = zlib.deflateSync(JSON.stringify(data));
+    const base64 = compressed.toString('base64');
+    return SESSION_PREFIX + base64;
+}
 
 router.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -42,32 +52,35 @@ function removeFile(filePath) {
     try { if (fs.existsSync(filePath)) fs.rmSync(filePath, { recursive: true, force: true }); } catch (e) {}
 }
 
-function collectSessionFiles(sessionDir) {
+// ✅ Only get creds.json, not all files
+function getCredsFile(sessionDir) {
     try {
-        const sessionData = {};
-        const files = fs.readdirSync(sessionDir);
-        for (const file of files) {
-            const filePath = path.join(sessionDir, file);
-            const stat = fs.statSync(filePath);
-            if (stat.isFile()) {
-                const content = fs.readFileSync(filePath);
-                sessionData[file] = content.toString('base64');
-            }
+        const credsPath = path.join(sessionDir, 'creds.json');
+        if (!fs.existsSync(credsPath)) {
+            return null;
         }
-        return sessionData;
+        const content = fs.readFileSync(credsPath);
+        return content.toString('base64');
     } catch (err) {
-        return {};
+        console.error(`Failed to read creds.json:`, err);
+        return null;
     }
 }
 
-function encryptSession(sessionData, sessionId) {
+function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+    const sessionData = {
+        creds: credsBase64,
+        timestamp: Date.now(),
+        version: '1.0'
+    };
+    
     if (!ENCRYPTION_KEY) {
         if (!encryptionWarningLogged) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
             encryptionWarningLogged = true;
         }
-        return JSON.stringify(sessionData);
+        return compressAndPrefix(sessionData);
     }
     
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
@@ -79,7 +92,7 @@ function encryptSession(sessionData, sessionId) {
     const authTag = cipher.getAuthTag().toString('base64');
     
     const package_ = { iv: iv.toString('base64'), data: encrypted, authTag, sessionId };
-    return Buffer.from(JSON.stringify(package_)).toString('base64');
+    return compressAndPrefix(package_);
 }
 
 async function getCachedVersion() {
@@ -180,7 +193,6 @@ router.get('/', async (req, res) => {
         setTimeout(() => removeFile(sessionDir), 5000);
     };
     
-    // ✅ Function to attach event handlers to a socket
     const attachEvents = (socket) => {
         socket.ev.on('creds.update', () => {
             console.log(`💾 [${sessionId}] creds.update`);
@@ -195,7 +207,6 @@ router.get('/', async (req, res) => {
             
             console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
             
-            // Send QR
             if (qr && !qrSent && !res.headersSent && !cleaned) {
                 qrSent = true;
                 try {
@@ -224,24 +235,20 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // ✅ Detect 515 restart - RECREATE SOCKET
             if (connection === 'close' && statusCode === 515 && !sessionExported && !userConnected) {
                 console.log(`🔄 [${sessionId}] Restart detected - recreating socket...`);
                 
                 if (reconnectTimer) clearTimeout(reconnectTimer);
                 
-                // Recreate socket with existing auth state after delay
                 setTimeout(() => {
                     if (!userConnected && !sessionExported && !cleaned) {
                         console.log(`🔁 [${sessionId}] Creating new socket after 515...`);
                         
-                        // Remove old listeners and close old socket
                         if (sock) {
                             sock.ev.removeAllListeners();
                             try { sock.end(); } catch (e) {}
                         }
                         
-                        // Create new socket with same auth state
                         const newSock = makeWASocket({
                             version,
                             auth: authState,
@@ -260,7 +267,6 @@ router.get('/', async (req, res) => {
                     }
                 }, 3000);
                 
-                // Set overall reconnect timeout
                 reconnectTimer = setTimeout(() => {
                     if (!userConnected && !sessionExported && !cleaned) {
                         console.log(`⏰ [${sessionId}] Reconnect timeout`);
@@ -270,7 +276,6 @@ router.get('/', async (req, res) => {
                 return;
             }
             
-            // ✅ Login detected
             if (connection === 'open' && socket?.user?.id && !userConnected) {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
@@ -278,43 +283,30 @@ router.get('/', async (req, res) => {
                 
                 if (reconnectTimer) clearTimeout(reconnectTimer);
                 
-                // Wait for files
                 console.log(`⏳ [${sessionId}] Waiting for files...`);
-                await delay(8000);
+                await delay(5000);
                 
                 try {
-                    const sessionFiles = collectSessionFiles(sessionDir);
+                    // ✅ Only get creds.json
+                    const credsBase64 = getCredsFile(sessionDir);
                     
-                    if (!sessionFiles["creds.json"]) {
-                        throw new Error('creds.json missing');
+                    if (!credsBase64) {
+                        throw new Error('creds.json not found');
                     }
                     
-                    const sessionPackage = {
-                        id: sessionId,
-                        user: socket.user.id,
-                        timestamp: Date.now(),
-                        files: sessionFiles
-                    };
-                    
-                    const sessionString = encryptSession(sessionPackage, sessionId);
+                    const sessionString = encryptSession(credsBase64, sessionId);
                     const sessionFile = path.join(sessionDir, 'session.txt');
                     fs.writeFileSync(sessionFile, sessionString);
                     
                     console.log(`📤 [${sessionId}] Sending session...`);
-                    
-                    // Send via WhatsApp
-                    if (sessionString.length > 60000) {
-                        await socket.sendMessage(socket.user.id, {
-                            text: `🔐 Session too large! Use manual retrieval:\n${BASE_URL}/qr/session/${sessionId}`
-                        });
-                    } else {
-                        await socket.sendMessage(socket.user.id, {
-                            text: `🔐 *GLE Session String*\n\n\`${sessionString}\``
-                        });
-                    }
+                    console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
                     await socket.sendMessage(socket.user.id, {
-                        text: `✅ *Session Complete!*\n\nSession ID: \`${sessionId}\``
+                        text: `🔐 *GleBot Session*\n\n\`${sessionString}\``
+                    });
+                    
+                    await socket.sendMessage(socket.user.id, {
+                        text: `✅ *Session Complete!*\n\nSession ID: \`${sessionId}\`\n\nManual retrieval: ${BASE_URL}/qr/session/${sessionId}`
                     });
                     
                     console.log(`✅ [${sessionId}] Session sent`);
@@ -340,7 +332,6 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // Handle other closes
             if (connection === 'close' && !sessionExported && !userConnected) {
                 console.log(`🔴 [${sessionId}] Connection closed without export`);
                 cleanup();
@@ -356,7 +347,6 @@ router.get('/', async (req, res) => {
         saveCredsFn = saveCreds;
         version = await getCachedVersion();
         
-        // Create initial socket
         sock = makeWASocket({
             version,
             auth: authState,
@@ -371,7 +361,6 @@ router.get('/', async (req, res) => {
         
         attachEvents(sock);
         
-        // QR timeout
         setTimeout(() => {
             if (!qrSent && !res.headersSent && !cleaned) {
                 res.status(504).json({ success: false, error: 'QR timeout', sessionId });
@@ -379,7 +368,6 @@ router.get('/', async (req, res) => {
             }
         }, 45000);
         
-        // Overall timeout
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Timeout`);
@@ -396,7 +384,6 @@ router.get('/', async (req, res) => {
     }
 });
 
-// Session retrieval
 router.get('/session/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const sessionDir = path.join(TEMP_DIR, sessionId);
