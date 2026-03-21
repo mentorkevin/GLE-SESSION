@@ -27,7 +27,7 @@ if (!fs.existsSync(TEMP_DIR)) {
 }
 
 const MAX_SESSIONS = 100;
-const CLEANUP_AGE = 3600000;
+const CLEANUP_AGE = 3600000; // 1 hour
 
 let cachedVersion = null;
 let versionCacheTime = 0;
@@ -151,6 +151,7 @@ setInterval(() => {
     }
 }, 600000);
 
+// Rate limit cleanup
 setInterval(() => {
     try {
         const now = Date.now();
@@ -361,6 +362,7 @@ router.get('/', async (req, res) => {
                         console.log(`✅ [${sessionId}] Session sent to user`);
                         sessionExported = true;
                         
+                        // Mega upload with timeout
                         (async () => {
                             try {
                                 console.log(`☁️ [${sessionId}] Background Mega upload...`);
@@ -404,3 +406,46 @@ router.get('/', async (req, res) => {
             }
         });
         
+        setTimeout(() => {
+            if (!sessionExported && !cleaned) {
+                console.log(`⏰ [${sessionId}] Code timeout`);
+                cleanup();
+            }
+        }, 120000);
+        
+    } catch (error) {
+        console.error(`Fatal:`, error);
+        if (!res.headersSent && !cleaned) {
+            res.status(500).json({ success: false, error: error.message, sessionId });
+        }
+        cleanup();
+    }
+});
+
+// Session retrieval with rate limit
+router.get('/session/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
+    const { key } = req.query;
+    const expectedKey = process.env.SESSION_RETRIEVAL_KEY;
+    
+    const clientIp = req.ip;
+    if (!checkRateLimit(clientIp)) {
+        return res.status(429).json({ success: false, error: 'Rate limited' });
+    }
+    
+    if (expectedKey && key !== expectedKey) {
+        return res.status(401).json({ success: false, error: 'Invalid or missing key' });
+    }
+    
+    const sessionDir = path.join(TEMP_DIR, sessionId);
+    const sessionFile = path.join(sessionDir, 'session.txt');
+    
+    if (fs.existsSync(sessionFile)) {
+        const sessionString = fs.readFileSync(sessionFile, 'utf8');
+        res.json({ success: true, sessionString, sessionId });
+    } else {
+        res.status(404).json({ success: false, error: 'Session not found or not ready', sessionId });
+    }
+});
+
+export default router;
