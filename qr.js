@@ -6,31 +6,34 @@ import { uploadSession } from './mega.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
-import cors from 'cors';
 
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// CORS protection
-router.use(cors({
-    origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
-    methods: ['GET'],
-    credentials: true
-}));
+// Simple CORS middleware
+router.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    next();
+});
 
 const TEMP_DIR = path.join(__dirname, 'temp_sessions');
+
+// Ensure TEMP_DIR exists on startup
+if (!fs.existsSync(TEMP_DIR)) {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+    console.log(`📁 Created temp directory: ${TEMP_DIR}`);
+}
+
 const MAX_SESSIONS = 100;
 const CLEANUP_AGE = 3600000; // 1 hour
 
-// Global version cache
 let cachedVersion = null;
 let versionCacheTime = 0;
-const VERSION_CACHE_TTL = 3600000; // 1 hour
+const VERSION_CACHE_TTL = 3600000;
 
-// Encryption warning - log once
 let encryptionWarningLogged = false;
-
-// Rate limiting
 const rateLimits = new Map();
 const BASE_URL = process.env.BASE_URL || 'https://gle-session-2.onrender.com';
 
@@ -128,9 +131,7 @@ setInterval(() => {
                     removeFile(filePath);
                     console.log(`🧹 Cleaned old session: ${file}`);
                 }
-            } catch (e) {
-                // File may have been deleted
-            }
+            } catch (e) {}
         }
         
         const sessions = fs.readdirSync(TEMP_DIR);
@@ -140,9 +141,7 @@ setInterval(() => {
                     const statA = fs.statSync(path.join(TEMP_DIR, a));
                     const statB = fs.statSync(path.join(TEMP_DIR, b));
                     return statA.mtimeMs - statB.mtimeMs;
-                } catch (e) {
-                    return 0;
-                }
+                } catch (e) { return 0; }
             });
             
             const toDelete = sessions.slice(0, sessions.length - MAX_SESSIONS);
@@ -165,17 +164,25 @@ setInterval(() => {
             if (recent.length === 0) rateLimits.delete(ip);
             else rateLimits.set(ip, recent);
         }
-    } catch (e) {
-        console.log("Rate limit cleanup error:", e.message);
-    }
+    } catch (e) {}
 }, 60000);
+
+// Health endpoint
+router.get('/health', (req, res) => {
+    const sessions = fs.existsSync(TEMP_DIR) ? fs.readdirSync(TEMP_DIR).length : 0;
+    res.json({
+        status: 'ok',
+        sessions,
+        uptime: process.uptime()
+    });
+});
 
 // ==================== QR ENDPOINT ====================
 router.get('/', async (req, res) => {
     const sessionId = makeid();
     const sessionDir = path.join(TEMP_DIR, sessionId);
     
-    const clientIp = req.ip || req.connection.remoteAddress;
+    const clientIp = req.ip;
     if (!checkRateLimit(clientIp)) {
         return res.status(429).json({ 
             success: false, 
@@ -203,7 +210,7 @@ router.get('/', async (req, res) => {
         if (cleanupTimer) clearTimeout(cleanupTimer);
         
         if (sock) {
-            sock.end(); // This removes listeners internally
+            sock.end();
         }
         
         setTimeout(() => {
@@ -318,10 +325,17 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session to user...`);
                     
                     try {
-                        await sock.sendMessage(sock.user.id, {
-                            text: `🔐 *GLE Session String*\n\n\`${sessionString}\``
-                        });
-                        console.log(`✅ [${sessionId}] Session string sent`);
+                        if (sessionString.length > 60000) {
+                            await sock.sendMessage(sock.user.id, {
+                                text: `🔐 *Session is too large for WhatsApp* (${sessionString.length} chars)\n\nUse manual retrieval:\n${BASE_URL}/qr/session/${sessionId}`
+                            });
+                            console.log(`✅ [${sessionId}] Large session - manual retrieval sent`);
+                        } else {
+                            await sock.sendMessage(sock.user.id, {
+                                text: `🔐 *GLE Session String*\n\n\`${sessionString}\``
+                            });
+                            console.log(`✅ [${sessionId}] Session string sent`);
+                        }
                         
                         await sock.sendMessage(sock.user.id, {
                             text: `✅ *Session Export Complete!*\n\nSession ID: \`${sessionId}\`\n\nManual retrieval: ${BASE_URL}/qr/session/${sessionId}`
@@ -330,14 +344,21 @@ router.get('/', async (req, res) => {
                         console.log(`✅ [${sessionId}] Session sent to user`);
                         sessionExported = true;
                         
-                        // Mega upload - no sessionExported check
+                        // Mega upload with timeout
                         (async () => {
                             try {
                                 console.log(`☁️ [${sessionId}] Background Mega upload...`);
-                                const megaUrl = await uploadSession(sessionString, sessionId);
+                                
+                                const megaUrl = await Promise.race([
+                                    uploadSession(sessionString, sessionId),
+                                    new Promise((_, reject) =>
+                                        setTimeout(() => reject(new Error("Mega timeout (60s)")), 60000)
+                                    )
+                                ]);
+                                
                                 if (megaUrl && !megaUrl.startsWith('local://')) {
                                     console.log(`✅ [${sessionId}] Mega upload complete`);
-                                    if (sock && sock.user) {
+                                    if (sock && sock.user && !cleaned) {
                                         try {
                                             await sock.sendMessage(sock.user.id, {
                                                 text: `💾 *Mega Backup*\n\n${megaUrl}`
@@ -390,11 +411,16 @@ router.get('/', async (req, res) => {
     }
 });
 
-// Session retrieval endpoint with optional key
+// Session retrieval with rate limit
 router.get('/session/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const { key } = req.query;
     const expectedKey = process.env.SESSION_RETRIEVAL_KEY;
+    
+    const clientIp = req.ip;
+    if (!checkRateLimit(clientIp)) {
+        return res.status(429).json({ success: false, error: 'Rate limited' });
+    }
     
     if (expectedKey && key !== expectedKey) {
         return res.status(401).json({ success: false, error: 'Invalid or missing key' });
