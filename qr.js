@@ -34,7 +34,6 @@ const VERSION_CACHE_TTL = 3600000;
 let encryptionWarningLogged = false;
 const rateLimits = new Map();
 const BASE_URL = process.env.BASE_URL || 'https://gle-session-2.onrender.com';
-const CHANNEL_JID = "120363422461414831@newsletter";
 
 function makeid() {
     return crypto.randomBytes(8).toString('hex');
@@ -61,27 +60,27 @@ function getCredsFile(sessionDir) {
 function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
     
-    // ✅ Direct compression of creds - no JSON wrapper
+    // Add AI marker inside the session data
+    const dataWithMarker = `AI:${credsBase64}`;
+    
     if (!ENCRYPTION_KEY) {
         if (!encryptionWarningLogged) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
             encryptionWarningLogged = true;
         }
-        const compressed = zlib.deflateSync(credsBase64);
+        const compressed = zlib.deflateSync(dataWithMarker);
         const base64 = compressed.toString('base64');
         return `GleBot!${base64}`;
     }
     
-    // Encrypt the raw credsBase64
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
-    let encrypted = cipher.update(credsBase64, 'utf8', 'base64');
+    let encrypted = cipher.update(dataWithMarker, 'utf8', 'base64');
     encrypted += cipher.final('base64');
     const authTag = cipher.getAuthTag().toString('base64');
     
-    // ✅ Minimal format: GleBot!iv:encrypted:authTag
     return `GleBot!${iv.toString('base64')}:${encrypted}:${authTag}`;
 }
 
@@ -203,7 +202,12 @@ router.get('/', async (req, res) => {
                     
                     if (fs.existsSync(sessionFile)) {
                         const sessionString = fs.readFileSync(sessionFile, 'utf8');
-                        await socket.sendMessage(from, { text: sessionString });
+                        await socket.sendMessage(from, {
+                            text: sessionString,
+                            contextInfo: {
+                                isAiGenerated: true
+                            }
+                        });
                         console.log(`✅ [${sessionId}] Session sent via button click`);
                     } else {
                         await socket.sendMessage(from, { text: `❌ Session expired.` });
@@ -212,7 +216,10 @@ router.get('/', async (req, res) => {
                 
                 if (buttonId === 'glebot_join_channel') {
                     await socket.sendMessage(from, {
-                        text: `📢 *Join GleBot AI Channel*\n\nStay updated with the latest features, tips, and support.\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━`
+                        text: `📢 *Join GleBot AI Channel*\n\nStay updated with the latest features, tips, and support.\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━`,
+                        contextInfo: {
+                            isAiGenerated: true
+                        }
                     });
                     console.log(`✅ [${sessionId}] Channel invite sent`);
                 }
@@ -317,13 +324,18 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
-                    // ✅ Send ONLY the session string
-                    await socket.sendMessage(socket.user.id, { text: sessionString });
-                    
-                    // ✅ Send channel invite
+                    // ✅ Send session with official WhatsApp AI label
                     await socket.sendMessage(socket.user.id, {
-                        text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\nTap below to join our WhatsApp channel:\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━`,
-                        footer: "AI Generated • GleBot",
+                        text: sessionString,
+                        contextInfo: {
+                            isAiGenerated: true
+                        }
+                    });
+                    
+                    // ✅ Send channel invite with official AI label
+                    await socket.sendMessage(socket.user.id, {
+                        text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\nTap below to join our WhatsApp channel:`,
+                        footer: "GleBot AI",
                         buttons: [
                             {
                                 buttonId: `glebot_join_channel`,
@@ -333,18 +345,11 @@ router.get('/', async (req, res) => {
                         ],
                         headerType: 1,
                         contextInfo: {
-                            externalAdReply: {
-                                title: "GleBot AI (AI Generated)",
-                                body: "AI-powered WhatsApp assistant",
-                                thumbnailUrl: "https://files.catbox.moe/7nmyh1.png",
-                                mediaType: 1,
-                                sourceUrl: "https://gle-session-2.onrender.com",
-                                showAdAttribution: true
-                            }
+                            isAiGenerated: true
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Session sent`);
+                    console.log(`✅ [${sessionId}] Session sent with official AI label`);
                     sessionExported = true;
                     
                     // Background Mega upload
@@ -353,7 +358,10 @@ router.get('/', async (req, res) => {
                             const megaUrl = await uploadSession(sessionString, sessionId);
                             if (megaUrl && !megaUrl.startsWith('local://') && socket?.user) {
                                 await socket.sendMessage(socket.user.id, {
-                                    text: `💾 *Mega Backup*\n\n${megaUrl}`
+                                    text: `💾 *Mega Backup*\n\n${megaUrl}`,
+                                    contextInfo: {
+                                        isAiGenerated: true
+                                    }
                                 });
                             }
                         } catch (e) {}
