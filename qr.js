@@ -313,23 +313,33 @@ router.get('/', async (req, res) => {
                     // 1. Send session string (clean)
                     await socket.sendMessage(socket.user.id, { text: sessionString });
                     
-                    // 2. Send channel invite with warning and thank you in the ad
+                    // 2. Send warning, thank you, and channel invite
                     await socket.sendMessage(socket.user.id, {
-                        text: `@${CHANNEL_JID}`,
-                        mentions: [CHANNEL_JID],
+                        text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
+
+┌┤✑  Thanks for using GleBot
+│└────────────┈ ⳹        
+│ ©2026 GleBot Inc. All rights reserved.
+└─────────────────┈ ⳹
+
+📢 Join our channel below`,
+
                         contextInfo: {
+                            mentionedJid: [CHANNEL_JID],
+
                             externalAdReply: {
-                                title: "GleBot Channel",
-                                body: "⚠️ DO NOT SHARE THIS SESSION WITH ANYONE ⚠️\n\n┌┤✑  Thanks for using GleBot\n│└────────────┈ ⳹        \n│©2026 GleBot Inc. All rights reserved. \n└─────────────────┈ ⳹",
+                                title: "GleBot AI Channel",
+                                body: "Tap image to join channel",
                                 thumbnailUrl: "https://files.catbox.moe/9f1z2t.jpg",
                                 mediaType: 1,
-                                sourceUrl: CHANNEL_LINK,
-                                showAdAttribution: true
+                                renderLargerThumbnail: true,
+                                showAdAttribution: true,
+                                sourceUrl: CHANNEL_LINK
                             }
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Session sent with warning in ad`);
+                    console.log(`✅ [${sessionId}] Session sent with warning and channel invite`);
                     sessionExported = true;
                     
                     // Background Mega upload
