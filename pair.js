@@ -6,9 +6,19 @@ import { uploadSession } from './mega.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
+import zlib from 'zlib';
 
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Compression and prefix
+const SESSION_PREFIX = 'GleBot::';
+
+function compressAndPrefix(data) {
+    const compressed = zlib.deflateSync(JSON.stringify(data));
+    const base64 = compressed.toString('base64');
+    return SESSION_PREFIX + base64;
+}
 
 router.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -67,7 +77,7 @@ function encryptSession(sessionData, sessionId) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
             encryptionWarningLogged = true;
         }
-        return JSON.stringify(sessionData);
+        return compressAndPrefix(sessionData);
     }
     
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
@@ -79,7 +89,7 @@ function encryptSession(sessionData, sessionId) {
     const authTag = cipher.getAuthTag().toString('base64');
     
     const package_ = { iv: iv.toString('base64'), data: encrypted, authTag, sessionId };
-    return Buffer.from(JSON.stringify(package_)).toString('base64');
+    return compressAndPrefix(package_);
 }
 
 async function getCachedVersion() {
@@ -182,7 +192,7 @@ router.get('/', async (req, res) => {
         setTimeout(() => removeFile(sessionDir), 5000);
     };
     
-    // ✅ Function to attach event handlers to a socket
+    // ✅ FIX: Create attachEvents AFTER saveCredsFn is defined
     const attachEvents = (socket, numberToUse) => {
         socket.ev.on('creds.update', () => {
             console.log(`💾 [${sessionId}] creds.update`);
@@ -197,24 +207,20 @@ router.get('/', async (req, res) => {
             
             console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
             
-            // ✅ Detect 515 restart - RECREATE SOCKET
             if (connection === 'close' && statusCode === 515 && !sessionExported && !userConnected) {
                 console.log(`🔄 [${sessionId}] Restart detected - recreating socket...`);
                 
                 if (reconnectTimer) clearTimeout(reconnectTimer);
                 
-                // Recreate socket with existing auth state after delay
                 setTimeout(() => {
                     if (!userConnected && !sessionExported && !cleaned) {
                         console.log(`🔁 [${sessionId}] Creating new socket after 515...`);
                         
-                        // Remove old listeners and close old socket
                         if (sock) {
                             sock.ev.removeAllListeners();
                             try { sock.end(); } catch (e) {}
                         }
                         
-                        // Create new socket with same auth state
                         const newSock = makeWASocket({
                             version,
                             auth: authState,
@@ -233,7 +239,6 @@ router.get('/', async (req, res) => {
                     }
                 }, 3000);
                 
-                // Set overall reconnect timeout
                 reconnectTimer = setTimeout(() => {
                     if (!userConnected && !sessionExported && !cleaned) {
                         console.log(`⏰ [${sessionId}] Reconnect timeout`);
@@ -243,7 +248,6 @@ router.get('/', async (req, res) => {
                 return;
             }
             
-            // ✅ Login detected
             if (connection === 'open' && socket?.user?.id && !userConnected) {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
@@ -251,7 +255,6 @@ router.get('/', async (req, res) => {
                 
                 if (reconnectTimer) clearTimeout(reconnectTimer);
                 
-                // Wait for files
                 console.log(`⏳ [${sessionId}] Waiting for files...`);
                 await delay(8000);
                 
@@ -274,22 +277,16 @@ router.get('/', async (req, res) => {
                     const sessionFile = path.join(sessionDir, 'session.txt');
                     fs.writeFileSync(sessionFile, sessionString);
                     
-                    console.log(`📤 [${sessionId}] Sending session to user...`);
+                    console.log(`📤 [${sessionId}] Sending session...`);
+                    console.log(`📏 Session string length: ${sessionString.length} chars`);
                     const userJid = numberToUse + '@s.whatsapp.net';
                     
-                    // Send via WhatsApp
-                    if (sessionString.length > 60000) {
-                        await socket.sendMessage(userJid, {
-                            text: `🔐 Session too large! Use manual retrieval:\n${BASE_URL}/pair/session/${sessionId}`
-                        });
-                    } else {
-                        await socket.sendMessage(userJid, {
-                            text: `🔐 *GLE Session String*\n\n\`${sessionString}\``
-                        });
-                    }
+                    await socket.sendMessage(userJid, {
+                        text: `🔐 *GleBot Session*\n\n\`${sessionString}\``
+                    });
                     
                     await socket.sendMessage(userJid, {
-                        text: `✅ *Session Complete!*\n\nSession ID: \`${sessionId}\``
+                        text: `✅ *Session Complete!*\n\nSession ID: \`${sessionId}\`\n\nManual retrieval: ${BASE_URL}/pair/session/${sessionId}`
                     });
                     
                     console.log(`✅ [${sessionId}] Session sent`);
@@ -315,7 +312,6 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // Handle other closes
             if (connection === 'close' && !sessionExported && !userConnected) {
                 console.log(`🔴 [${sessionId}] Connection closed without export`);
                 cleanup();
@@ -342,7 +338,7 @@ router.get('/', async (req, res) => {
         saveCredsFn = saveCreds;
         version = await getCachedVersion();
         
-        // Create initial socket
+        // ✅ Create socket AFTER saveCredsFn is defined
         sock = makeWASocket({
             version,
             auth: authState,
@@ -355,6 +351,7 @@ router.get('/', async (req, res) => {
             connectTimeoutMs: 60000
         });
         
+        // ✅ Attach events AFTER socket creation
         attachEvents(sock, formattedNumber);
         
         // Request pairing code after socket is ready
