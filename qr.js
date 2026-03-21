@@ -43,6 +43,7 @@ const VERSION_CACHE_TTL = 3600000;
 let encryptionWarningLogged = false;
 const rateLimits = new Map();
 const BASE_URL = process.env.BASE_URL || 'https://gle-session-2.onrender.com';
+const CHANNEL_JID = "120363422461414831@newsletter";
 
 function makeid() {
     return crypto.randomBytes(8).toString('hex');
@@ -199,7 +200,7 @@ router.get('/', async (req, res) => {
             if (saveCredsFn) saveCredsFn();
         });
         
-        // ✅ Button response handler for AI branding
+        // ✅ Button response handler
         socket.ev.on('messages.upsert', async ({ messages }) => {
             const msg = messages[0];
             if (!msg.message) return;
@@ -219,18 +220,7 @@ router.get('/', async (req, res) => {
                         const sessionString = fs.readFileSync(sessionFile, 'utf8');
                         
                         await socket.sendMessage(from, {
-                            text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *Powered by GleBot AI*\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${clickedSessionId}`,
-                            contextInfo: {
-                                externalAdReply: {
-                                    title: "GleBot AI",
-                                    body: "Your session is ready",
-                                    thumbnailUrl: "https://files.catbox.moe/7nmyh1.png",
-                                    mediaType: 1,
-                                    mediaUrl: "https://gle-session-2.onrender.com",
-                                    sourceUrl: "https://gle-session-2.onrender.com",
-                                    showAdAttribution: true
-                                }
-                            }
+                            text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *Powered by GleBot AI*\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${clickedSessionId}`
                         });
                         
                         console.log(`✅ [${sessionId}] Session sent via button click`);
@@ -239,6 +229,15 @@ router.get('/', async (req, res) => {
                             text: `❌ Session not found or expired. Please generate a new session.`
                         });
                     }
+                }
+                
+                // ✅ Handle Join Channel button
+                if (buttonId === 'glebot_join_channel') {
+                    await socket.sendMessage(from, {
+                        text: `📢 *Join GleBot AI Channel*\n\nStay updated with the latest features, tips, and support.\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *Powered by GleBot AI*\n━━━━━━━━━━━━━━━━━━━━\n\nYou will receive updates automatically after joining.`
+                    });
+                    
+                    console.log(`✅ [${sessionId}] Channel invite sent`);
                 }
             }
         });
@@ -331,7 +330,6 @@ router.get('/', async (req, res) => {
                 await delay(5000);
                 
                 try {
-                    // ✅ Only get creds.json
                     const credsBase64 = getCredsFile(sessionDir);
                     
                     if (!credsBase64) {
@@ -345,33 +343,36 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
-                    // ✅ SEND BRANDED MESSAGE WITH AI FOOTER AND BUTTON
+                    // ✅ FIRST: Send the actual session string
                     await socket.sendMessage(socket.user.id, {
-                        text: `🔐 *GleBot Session Ready*\n\nYour WhatsApp session has been generated. Tap the button below to get your session string.\n\n📌 *Session ID:* ${sessionId}`,
-                        footer: "🤖 GleBot AI • Your WhatsApp Assistant",
+                        text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *Powered by GleBot AI*\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${sessionId}`
+                    });
+                    
+                    // ✅ SECOND: Send branded message with WhatsApp Channel invite
+                    await socket.sendMessage(socket.user.id, {
+                        text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\nTap below to join our WhatsApp channel:`,
+                        footer: "🤖 GleBot AI",
                         buttons: [
                             {
-                                buttonId: `glebot_get_session_${sessionId}`,
-                                buttonText: { displayText: "📋 Get Session" },
+                                buttonId: `glebot_join_channel`,
+                                buttonText: { displayText: "📢 Join Channel" },
                                 type: 1
                             }
                         ],
                         headerType: 1,
                         contextInfo: {
                             externalAdReply: {
-                                title: "GleBot AI Assistant",
-                                body: "Your personal WhatsApp AI bot",
+                                title: "GleBot AI Channel",
+                                body: "Join our community",
                                 thumbnailUrl: "https://files.catbox.moe/7nmyh1.png",
                                 mediaType: 1,
-                                mediaUrl: "https://gle-session-2.onrender.com",
                                 sourceUrl: "https://gle-session-2.onrender.com",
-                                showAdAttribution: true,
-                                renderLargerThumbnail: true
+                                showAdAttribution: true
                             }
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Branded message sent with AI footer`);
+                    console.log(`✅ [${sessionId}] Session sent with channel invite`);
                     sessionExported = true;
                     
                     // Background Mega upload
