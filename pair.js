@@ -11,7 +11,6 @@ import zlib from 'zlib';
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Compression and prefix
 const SESSION_PREFIX = 'GleBot::';
 
 function compressAndPrefix(data) {
@@ -52,26 +51,29 @@ function removeFile(filePath) {
     try { if (fs.existsSync(filePath)) fs.rmSync(filePath, { recursive: true, force: true }); } catch (e) {}
 }
 
-function collectSessionFiles(sessionDir) {
+// ✅ Only get creds.json
+function getCredsFile(sessionDir) {
     try {
-        const sessionData = {};
-        const files = fs.readdirSync(sessionDir);
-        for (const file of files) {
-            const filePath = path.join(sessionDir, file);
-            const stat = fs.statSync(filePath);
-            if (stat.isFile()) {
-                const content = fs.readFileSync(filePath);
-                sessionData[file] = content.toString('base64');
-            }
+        const credsPath = path.join(sessionDir, 'creds.json');
+        if (!fs.existsSync(credsPath)) {
+            return null;
         }
-        return sessionData;
+        const content = fs.readFileSync(credsPath);
+        return content.toString('base64');
     } catch (err) {
-        return {};
+        console.error(`Failed to read creds.json:`, err);
+        return null;
     }
 }
 
-function encryptSession(sessionData, sessionId) {
+function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+    const sessionData = {
+        creds: credsBase64,
+        timestamp: Date.now(),
+        version: '1.0'
+    };
+    
     if (!ENCRYPTION_KEY) {
         if (!encryptionWarningLogged) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
@@ -192,7 +194,6 @@ router.get('/', async (req, res) => {
         setTimeout(() => removeFile(sessionDir), 5000);
     };
     
-    // ✅ FIX: Create attachEvents AFTER saveCredsFn is defined
     const attachEvents = (socket, numberToUse) => {
         socket.ev.on('creds.update', () => {
             console.log(`💾 [${sessionId}] creds.update`);
@@ -256,24 +257,17 @@ router.get('/', async (req, res) => {
                 if (reconnectTimer) clearTimeout(reconnectTimer);
                 
                 console.log(`⏳ [${sessionId}] Waiting for files...`);
-                await delay(8000);
+                await delay(5000);
                 
                 try {
-                    const sessionFiles = collectSessionFiles(sessionDir);
+                    // ✅ Only get creds.json
+                    const credsBase64 = getCredsFile(sessionDir);
                     
-                    if (!sessionFiles["creds.json"]) {
-                        throw new Error('creds.json missing');
+                    if (!credsBase64) {
+                        throw new Error('creds.json not found');
                     }
                     
-                    const sessionPackage = {
-                        id: sessionId,
-                        user: socket.user.id,
-                        number: numberToUse,
-                        timestamp: Date.now(),
-                        files: sessionFiles
-                    };
-                    
-                    const sessionString = encryptSession(sessionPackage, sessionId);
+                    const sessionString = encryptSession(credsBase64, sessionId);
                     const sessionFile = path.join(sessionDir, 'session.txt');
                     fs.writeFileSync(sessionFile, sessionString);
                     
@@ -338,7 +332,6 @@ router.get('/', async (req, res) => {
         saveCredsFn = saveCreds;
         version = await getCachedVersion();
         
-        // ✅ Create socket AFTER saveCredsFn is defined
         sock = makeWASocket({
             version,
             auth: authState,
@@ -351,10 +344,8 @@ router.get('/', async (req, res) => {
             connectTimeoutMs: 60000
         });
         
-        // ✅ Attach events AFTER socket creation
         attachEvents(sock, formattedNumber);
         
-        // Request pairing code after socket is ready
         setTimeout(async () => {
             if (codeSent || sessionExported || cleaned) return;
             
@@ -394,7 +385,6 @@ router.get('/', async (req, res) => {
             }
         }, 3000);
         
-        // Overall timeout
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Timeout`);
@@ -411,7 +401,6 @@ router.get('/', async (req, res) => {
     }
 });
 
-// Session retrieval
 router.get('/session/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const sessionDir = path.join(TEMP_DIR, sessionId);
