@@ -11,14 +11,6 @@ import zlib from 'zlib';
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const SESSION_PREFIX = 'GleBot::';
-
-function compressAndPrefix(data) {
-    const compressed = zlib.deflateSync(JSON.stringify(data));
-    const base64 = compressed.toString('base64');
-    return SESSION_PREFIX + base64;
-}
-
 router.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET');
@@ -42,6 +34,7 @@ const VERSION_CACHE_TTL = 3600000;
 let encryptionWarningLogged = false;
 const rateLimits = new Map();
 const BASE_URL = process.env.BASE_URL || 'https://gle-session-2.onrender.com';
+const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
 
 function makeid() {
     return crypto.randomBytes(8).toString('hex');
@@ -51,7 +44,6 @@ function removeFile(filePath) {
     try { if (fs.existsSync(filePath)) fs.rmSync(filePath, { recursive: true, force: true }); } catch (e) {}
 }
 
-// ✅ Only get creds.json
 function getCredsFile(sessionDir) {
     try {
         const credsPath = path.join(sessionDir, 'creds.json');
@@ -68,30 +60,27 @@ function getCredsFile(sessionDir) {
 
 function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
-    const sessionData = {
-        creds: credsBase64,
-        timestamp: Date.now(),
-        version: '1.0'
-    };
     
+    // ✅ No AI marker, just compress the raw creds
     if (!ENCRYPTION_KEY) {
         if (!encryptionWarningLogged) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
             encryptionWarningLogged = true;
         }
-        return compressAndPrefix(sessionData);
+        const compressed = zlib.deflateSync(credsBase64);
+        const base64 = compressed.toString('base64');
+        return `GleBot!${base64}`;
     }
     
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
-    const iv = crypto.randomBytes(16);
+    const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
-    let encrypted = cipher.update(JSON.stringify(sessionData), 'utf8', 'base64');
+    let encrypted = cipher.update(credsBase64, 'utf8', 'base64');
     encrypted += cipher.final('base64');
     const authTag = cipher.getAuthTag().toString('base64');
     
-    const package_ = { iv: iv.toString('base64'), data: encrypted, authTag, sessionId };
-    return compressAndPrefix(package_);
+    return `GleBot!${iv.toString('base64')}:${encrypted}:${authTag}`;
 }
 
 async function getCachedVersion() {
@@ -119,7 +108,6 @@ function checkRateLimit(ip) {
     return true;
 }
 
-// Cleanup intervals
 setInterval(() => {
     try {
         if (!fs.existsSync(TEMP_DIR)) return;
@@ -260,7 +248,6 @@ router.get('/', async (req, res) => {
                 await delay(5000);
                 
                 try {
-                    // ✅ Only get creds.json
                     const credsBase64 = getCredsFile(sessionDir);
                     
                     if (!credsBase64) {
@@ -275,15 +262,32 @@ router.get('/', async (req, res) => {
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     const userJid = numberToUse + '@s.whatsapp.net';
                     
+                    // 1. Send session string (clean)
+                    await socket.sendMessage(userJid, { text: sessionString });
+                    
+                    // 2. Send warning, thank you, and channel link
                     await socket.sendMessage(userJid, {
-                        text: `🔐 *GleBot Session*\n\n\`${sessionString}\``
+                        text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
+
+┌┤✑  Thanks for using GleBot
+│└────────────┈ ⳹        
+│ ©2026 GleBot Inc. All rights reserved.
+└─────────────────┈ ⳹
+
+📢 Join our channel: ${CHANNEL_LINK}`,
+                        contextInfo: {
+                            externalAdReply: {
+                                title: "GleBot AI Channel",
+                                body: "Join our community",
+                                thumbnailUrl: "https://files.catbox.moe/9f1z2t.jpg",
+                                mediaType: 1,
+                                sourceUrl: CHANNEL_LINK,
+                                showAdAttribution: true
+                            }
+                        }
                     });
                     
-                    await socket.sendMessage(userJid, {
-                        text: `✅ *Session Complete!*\n\nSession ID: \`${sessionId}\`\n\nManual retrieval: ${BASE_URL}/pair/session/${sessionId}`
-                    });
-                    
-                    console.log(`✅ [${sessionId}] Session sent`);
+                    console.log(`✅ [${sessionId}] Session sent with warning and channel link`);
                     sessionExported = true;
                     
                     // Background Mega upload
@@ -367,10 +371,7 @@ router.get('/', async (req, res) => {
                             '1. Open WhatsApp on your phone',
                             '2. Go to Settings > Linked Devices',
                             '3. Tap "Link a Device"',
-                            `4. Enter the code: ${formattedCode}`,
-                            '',
-                            `Session ID: ${sessionId}`,
-                            `Manual retrieval: ${BASE_URL}/pair/session/${sessionId}`
+                            `4. Enter the code: ${formattedCode}`
                         ],
                         expiresIn: 120
                     });
@@ -408,9 +409,9 @@ router.get('/session/:sessionId', (req, res) => {
     
     if (fs.existsSync(sessionFile)) {
         const sessionString = fs.readFileSync(sessionFile, 'utf8');
-        res.json({ success: true, sessionString, sessionId });
+        res.json({ success: true, sessionString });
     } else {
-        res.status(404).json({ success: false, error: 'Session not found', sessionId });
+        res.status(404).json({ success: false, error: 'Session not found' });
     }
 });
 
