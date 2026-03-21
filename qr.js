@@ -326,10 +326,10 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
-                    // Send session string
+                    // 1. Send session string
                     await socket.sendMessage(socket.user.id, { text: sessionString });
                     
-                    // ✅ Send channel invite with PROPER button
+                    // 2. Send button message (text + button, no ad)
                     await socket.sendMessage(socket.user.id, {
                         text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\nTap the button below to join our WhatsApp channel:`,
                         footer: "GleBot AI",
@@ -339,8 +339,12 @@ router.get('/', async (req, res) => {
                                 buttonText: { displayText: "📢 Join Channel" },
                                 type: 1
                             }
-                        ],
-                        headerType: 1,
+                        ]
+                    });
+                    
+                    // 3. Send channel link with ad thumbnail
+                    await socket.sendMessage(socket.user.id, {
+                        text: `${CHANNEL_LINK}`,
                         contextInfo: {
                             externalAdReply: {
                                 title: "GleBot AI Channel",
@@ -353,7 +357,7 @@ router.get('/', async (req, res) => {
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Session sent with channel button`);
+                    console.log(`✅ [${sessionId}] Session sent with channel button and ad`);
                     sessionExported = true;
                     
                     // Background Mega upload
