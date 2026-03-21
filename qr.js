@@ -114,7 +114,7 @@ function checkRateLimit(ip) {
     return true;
 }
 
-// Cleanup intervals (same as before)
+// Cleanup intervals
 setInterval(() => {
     try {
         if (!fs.existsSync(TEMP_DIR)) return;
@@ -194,6 +194,7 @@ router.get('/', async (req, res) => {
     let credsUpdateCount = 0;
     let restartDetected = false;
     let cleanupTimer = null;
+    let reconnectTimer = null;
     let cleaned = false;
     
     const cleanup = () => {
@@ -203,6 +204,7 @@ router.get('/', async (req, res) => {
         console.log(`🧹 [${sessionId}] Starting cleanup...`);
         
         if (cleanupTimer) clearTimeout(cleanupTimer);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
         
         if (sock) {
             sock.end();
@@ -282,11 +284,19 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // ✅ CRITICAL: Detect 515 restart - DON'T cleanup, wait for reconnect
+            // Detect 515 restart
             if (connection === 'close' && statusCode === 515 && !sessionExported) {
                 console.log(`🔄 [${sessionId}] WhatsApp restart (515) - waiting for reconnect...`);
                 restartDetected = true;
-                // Don't cleanup - wait for reconnect
+                
+                // Set a reconnect timeout (30 seconds)
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(() => {
+                    if (!sessionExported && !userConnected) {
+                        console.log(`⏰ [${sessionId}] Reconnect timeout - no connection after restart`);
+                        cleanup();
+                    }
+                }, 30000);
                 return;
             }
             
@@ -296,13 +306,16 @@ router.get('/', async (req, res) => {
                 cleanup();
             }
             
-            // ✅ Login detected - this happens after the 515 restart
+            // Login detected after reconnect
             if (connection === 'open' && sock.user && !userConnected) {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
                 console.log(`👤 User: ${sock.user.id}`);
                 
-                // Wait a bit for files to be written
+                // Clear reconnect timer
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                
+                // Wait for files
                 console.log(`⏳ [${sessionId}] Waiting 5 seconds for files to write...`);
                 await delay(5000);
                 
