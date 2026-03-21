@@ -20,14 +20,13 @@ router.use((req, res, next) => {
 
 const TEMP_DIR = path.join(__dirname, 'temp_sessions');
 
-// Ensure TEMP_DIR exists on startup
 if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
     console.log(`📁 Created temp directory: ${TEMP_DIR}`);
 }
 
 const MAX_SESSIONS = 100;
-const CLEANUP_AGE = 3600000; // 1 hour
+const CLEANUP_AGE = 3600000;
 
 let cachedVersion = null;
 let versionCacheTime = 0;
@@ -115,14 +114,12 @@ function checkRateLimit(ip) {
     return true;
 }
 
-// Cleanup intervals
+// Cleanup intervals (same as before)
 setInterval(() => {
     try {
         if (!fs.existsSync(TEMP_DIR)) return;
-        
         const files = fs.readdirSync(TEMP_DIR);
         const now = Date.now();
-        
         for (const file of files) {
             const filePath = path.join(TEMP_DIR, file);
             try {
@@ -133,7 +130,6 @@ setInterval(() => {
                 }
             } catch (e) {}
         }
-        
         const sessions = fs.readdirSync(TEMP_DIR);
         if (sessions.length > MAX_SESSIONS) {
             sessions.sort((a, b) => {
@@ -143,7 +139,6 @@ setInterval(() => {
                     return statA.mtimeMs - statB.mtimeMs;
                 } catch (e) { return 0; }
             });
-            
             const toDelete = sessions.slice(0, sessions.length - MAX_SESSIONS);
             for (const session of toDelete) {
                 removeFile(path.join(TEMP_DIR, session));
@@ -155,7 +150,6 @@ setInterval(() => {
     }
 }, 600000);
 
-// Rate limit cleanup
 setInterval(() => {
     try {
         const now = Date.now();
@@ -198,6 +192,7 @@ router.get('/', async (req, res) => {
     let sessionExported = false;
     let userConnected = false;
     let credsUpdateCount = 0;
+    let restartDetected = false;
     let cleanupTimer = null;
     let cleaned = false;
     
@@ -248,9 +243,12 @@ router.get('/', async (req, res) => {
         sock.ev.on('connection.update', async (update) => {
             if (sessionExported || cleaned) return;
             
-            const { connection, qr } = update;
-            console.log(`[${sessionId}] State:`, connection || 'waiting');
+            const { connection, qr, lastDisconnect } = update;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
             
+            console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
+            
+            // Generate and send QR
             if (qr && !qrSent && !res.headersSent && !cleaned) {
                 qrSent = true;
                 try {
@@ -284,16 +282,27 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            if (connection === 'close' && !sessionExported) {
+            // ✅ CRITICAL: Detect 515 restart - DON'T cleanup, wait for reconnect
+            if (connection === 'close' && statusCode === 515 && !sessionExported) {
+                console.log(`🔄 [${sessionId}] WhatsApp restart (515) - waiting for reconnect...`);
+                restartDetected = true;
+                // Don't cleanup - wait for reconnect
+                return;
+            }
+            
+            // Only cleanup on close if it's not a 515 restart
+            if (connection === 'close' && !sessionExported && !restartDetected) {
                 console.log(`🔴 [${sessionId}] Connection closed without export`);
                 cleanup();
             }
             
+            // ✅ Login detected - this happens after the 515 restart
             if (connection === 'open' && sock.user && !userConnected) {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
                 console.log(`👤 User: ${sock.user.id}`);
                 
+                // Wait a bit for files to be written
                 console.log(`⏳ [${sessionId}] Waiting 5 seconds for files to write...`);
                 await delay(5000);
                 
@@ -344,11 +353,10 @@ router.get('/', async (req, res) => {
                         console.log(`✅ [${sessionId}] Session sent to user`);
                         sessionExported = true;
                         
-                        // Mega upload with timeout
+                        // Mega upload in background
                         (async () => {
                             try {
                                 console.log(`☁️ [${sessionId}] Background Mega upload...`);
-                                
                                 const megaUrl = await Promise.race([
                                     uploadSession(sessionString, sessionId),
                                     new Promise((_, reject) =>
