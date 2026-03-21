@@ -11,9 +11,6 @@ import zlib from 'zlib';
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Compression and prefix
-const SESSION_PREFIX = 'GleBot!';
-
 router.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET');
@@ -64,32 +61,28 @@ function getCredsFile(sessionDir) {
 function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
     
-    const sessionData = {
-        c: credsBase64,
-        t: Date.now(),
-        v: '1'
-    };
-    
+    // ✅ Direct compression of creds - no JSON wrapper
     if (!ENCRYPTION_KEY) {
         if (!encryptionWarningLogged) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
             encryptionWarningLogged = true;
         }
-        const compressed = zlib.deflateSync(JSON.stringify(sessionData));
+        const compressed = zlib.deflateSync(credsBase64);
         const base64 = compressed.toString('base64');
         return `GleBot!${base64}`;
     }
     
+    // Encrypt the raw credsBase64
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
-    let encrypted = cipher.update(JSON.stringify(sessionData), 'utf8', 'base64');
+    let encrypted = cipher.update(credsBase64, 'utf8', 'base64');
     encrypted += cipher.final('base64');
     const authTag = cipher.getAuthTag().toString('base64');
     
-    const compact = `GleBot!${iv.toString('base64')}:${encrypted}:${authTag}`;
-    return compact;
+    // ✅ Minimal format: GleBot!iv:encrypted:authTag
+    return `GleBot!${iv.toString('base64')}:${encrypted}:${authTag}`;
 }
 
 async function getCachedVersion() {
@@ -210,14 +203,10 @@ router.get('/', async (req, res) => {
                     
                     if (fs.existsSync(sessionFile)) {
                         const sessionString = fs.readFileSync(sessionFile, 'utf8');
-                        await socket.sendMessage(from, {
-                            text: sessionString
-                        });
+                        await socket.sendMessage(from, { text: sessionString });
                         console.log(`✅ [${sessionId}] Session sent via button click`);
                     } else {
-                        await socket.sendMessage(from, {
-                            text: `❌ Session expired. Please generate a new one.`
-                        });
+                        await socket.sendMessage(from, { text: `❌ Session expired.` });
                     }
                 }
                 
@@ -329,11 +318,9 @@ router.get('/', async (req, res) => {
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
                     // ✅ Send ONLY the session string
-                    await socket.sendMessage(socket.user.id, {
-                        text: sessionString
-                    });
+                    await socket.sendMessage(socket.user.id, { text: sessionString });
                     
-                    // ✅ Send channel invite with AI branding
+                    // ✅ Send channel invite
                     await socket.sendMessage(socket.user.id, {
                         text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\nTap below to join our WhatsApp channel:\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━`,
                         footer: "AI Generated • GleBot",
@@ -432,7 +419,6 @@ router.get('/', async (req, res) => {
     }
 });
 
-// Keep session retrieval endpoint for users who lose the session
 router.get('/session/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const sessionDir = path.join(TEMP_DIR, sessionId);
@@ -440,9 +426,9 @@ router.get('/session/:sessionId', (req, res) => {
     
     if (fs.existsSync(sessionFile)) {
         const sessionString = fs.readFileSync(sessionFile, 'utf8');
-        res.json({ success: true, sessionString, sessionId });
+        res.json({ success: true, sessionString });
     } else {
-        res.status(404).json({ success: false, error: 'Session not found', sessionId });
+        res.status(404).json({ success: false, error: 'Session not found' });
     }
 });
 
