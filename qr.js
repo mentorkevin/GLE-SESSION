@@ -34,6 +34,7 @@ const VERSION_CACHE_TTL = 3600000;
 let encryptionWarningLogged = false;
 const rateLimits = new Map();
 const BASE_URL = process.env.BASE_URL || 'https://gle-session-2.onrender.com';
+const CHANNEL_JID = "120363422461414831@newsletter";
 
 function makeid() {
     return crypto.randomBytes(8).toString('hex');
@@ -60,7 +61,6 @@ function getCredsFile(sessionDir) {
 function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
     
-    // Add AI marker inside the session data
     const dataWithMarker = `AI:${credsBase64}`;
     
     if (!ENCRYPTION_KEY) {
@@ -202,12 +202,7 @@ router.get('/', async (req, res) => {
                     
                     if (fs.existsSync(sessionFile)) {
                         const sessionString = fs.readFileSync(sessionFile, 'utf8');
-                        await socket.sendMessage(from, {
-                            text: sessionString,
-                            contextInfo: {
-                                isAiGenerated: true
-                            }
-                        });
+                        await socket.sendMessage(from, { text: sessionString });
                         console.log(`✅ [${sessionId}] Session sent via button click`);
                     } else {
                         await socket.sendMessage(from, { text: `❌ Session expired.` });
@@ -215,10 +210,18 @@ router.get('/', async (req, res) => {
                 }
                 
                 if (buttonId === 'glebot_join_channel') {
+                    // Send channel invite using JID
                     await socket.sendMessage(from, {
-                        text: `📢 *Join GleBot AI Channel*\n\nStay updated with the latest features, tips, and support.\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━`,
+                        text: `📢 *Join GleBot AI Channel*\n\nStay updated with the latest features, tips, and support.\n\n━━━━━━━━━━━━━━━━━━━━\n📌 *Channel:* GleBot AI\n🔗 *JID:* \`${CHANNEL_JID}\`\n━━━━━━━━━━━━━━━━━━━━\n\n🤖 *AI Generated*\n⚡ Powered by GleBot AI`,
                         contextInfo: {
-                            isAiGenerated: true
+                            externalAdReply: {
+                                title: "GleBot AI Channel",
+                                body: "Join our community",
+                                thumbnailUrl: "https://files.catbox.moe/9f1z2t.jpg",
+                                mediaType: 1,
+                                sourceUrl: "https://gle-session-2.onrender.com",
+                                showAdAttribution: true
+                            }
                         }
                     });
                     console.log(`✅ [${sessionId}] Channel invite sent`);
@@ -324,32 +327,35 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
-                    // ✅ Send session with official WhatsApp AI label
-                    await socket.sendMessage(socket.user.id, {
-                        text: sessionString,
-                        contextInfo: {
-                            isAiGenerated: true
-                        }
-                    });
+                    // Send session string
+                    await socket.sendMessage(socket.user.id, { text: sessionString });
                     
-                    // ✅ Send channel invite with official AI label
+                    // Send channel invite with JID and button
                     await socket.sendMessage(socket.user.id, {
-                        text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\nTap below to join our WhatsApp channel:`,
+                        text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\n📌 *Channel JID:* \`${CHANNEL_JID}\`\n\nTap the button below to get the channel link:`,
                         footer: "GleBot AI",
                         buttons: [
                             {
                                 buttonId: `glebot_join_channel`,
-                                buttonText: { displayText: "📢 Join Channel" },
+                                buttonText: { displayText: "📢 Get Channel Info" },
                                 type: 1
                             }
                         ],
                         headerType: 1,
                         contextInfo: {
-                            isAiGenerated: true
+                            externalAdReply: {
+                                title: "GleBot AI Channel",
+                                body: "Join our community",
+                                thumbnailUrl: "https://files.catbox.moe/9f1z2t.jpg",
+                                mediaType: 1,
+                                sourceUrl: "https://gle-session-2.onrender.com",
+                                renderLargerThumbnail: true,
+                                showAdAttribution: true
+                            }
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Session sent with official AI label`);
+                    console.log(`✅ [${sessionId}] Session sent with channel JID`);
                     sessionExported = true;
                     
                     // Background Mega upload
@@ -358,10 +364,7 @@ router.get('/', async (req, res) => {
                             const megaUrl = await uploadSession(sessionString, sessionId);
                             if (megaUrl && !megaUrl.startsWith('local://') && socket?.user) {
                                 await socket.sendMessage(socket.user.id, {
-                                    text: `💾 *Mega Backup*\n\n${megaUrl}`,
-                                    contextInfo: {
-                                        isAiGenerated: true
-                                    }
+                                    text: `💾 *Mega Backup*\n\n${megaUrl}`
                                 });
                             }
                         } catch (e) {}
