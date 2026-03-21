@@ -34,7 +34,6 @@ const VERSION_CACHE_TTL = 3600000;
 let encryptionWarningLogged = false;
 const rateLimits = new Map();
 const BASE_URL = process.env.BASE_URL || 'https://gle-session-2.onrender.com';
-const CHANNEL_JID = "120363422461414831@newsletter";
 const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
 
 function makeid() {
@@ -313,7 +312,7 @@ router.get('/', async (req, res) => {
                     // 1. Send session string (clean)
                     await socket.sendMessage(socket.user.id, { text: sessionString });
                     
-                    // 2. Send warning, thank you, and channel invite
+                    // 2. Send warning, thank you, and channel link
                     await socket.sendMessage(socket.user.id, {
                         text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
@@ -322,24 +321,20 @@ router.get('/', async (req, res) => {
 │ ©2026 GleBot Inc. All rights reserved.
 └─────────────────┈ ⳹
 
-📢 Join our channel below`,
-
+📢 Join our channel: ${CHANNEL_LINK}`,
                         contextInfo: {
-                            mentionedJid: [CHANNEL_JID],
-
                             externalAdReply: {
                                 title: "GleBot AI Channel",
-                                body: "Tap image to join channel",
+                                body: "Join our community",
                                 thumbnailUrl: "https://files.catbox.moe/9f1z2t.jpg",
                                 mediaType: 1,
-                                renderLargerThumbnail: true,
-                                showAdAttribution: true,
-                                sourceUrl: CHANNEL_LINK
+                                sourceUrl: CHANNEL_LINK,
+                                showAdAttribution: true
                             }
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Session sent with warning and channel invite`);
+                    console.log(`✅ [${sessionId}] Session sent with warning and channel link`);
                     sessionExported = true;
                     
                     // Background Mega upload
