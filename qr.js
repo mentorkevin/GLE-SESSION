@@ -12,13 +12,7 @@ const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Compression and prefix
-const SESSION_PREFIX = 'GleBot::';
-
-function compressAndPrefix(data) {
-    const compressed = zlib.deflateSync(JSON.stringify(data));
-    const base64 = compressed.toString('base64');
-    return SESSION_PREFIX + base64;
-}
+const SESSION_PREFIX = 'GleBot!';
 
 router.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -53,7 +47,6 @@ function removeFile(filePath) {
     try { if (fs.existsSync(filePath)) fs.rmSync(filePath, { recursive: true, force: true }); } catch (e) {}
 }
 
-// ✅ Only get creds.json, not all files
 function getCredsFile(sessionDir) {
     try {
         const credsPath = path.join(sessionDir, 'creds.json');
@@ -70,10 +63,11 @@ function getCredsFile(sessionDir) {
 
 function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+    
     const sessionData = {
-        creds: credsBase64,
-        timestamp: Date.now(),
-        version: '1.0'
+        c: credsBase64,
+        t: Date.now(),
+        v: '1'
     };
     
     if (!ENCRYPTION_KEY) {
@@ -81,19 +75,21 @@ function encryptSession(credsBase64, sessionId) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
             encryptionWarningLogged = true;
         }
-        return compressAndPrefix(sessionData);
+        const compressed = zlib.deflateSync(JSON.stringify(sessionData));
+        const base64 = compressed.toString('base64');
+        return `GleBot!${base64}`;
     }
     
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
-    const iv = crypto.randomBytes(16);
+    const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
     let encrypted = cipher.update(JSON.stringify(sessionData), 'utf8', 'base64');
     encrypted += cipher.final('base64');
     const authTag = cipher.getAuthTag().toString('base64');
     
-    const package_ = { iv: iv.toString('base64'), data: encrypted, authTag, sessionId };
-    return compressAndPrefix(package_);
+    const compact = `GleBot!${iv.toString('base64')}:${encrypted}:${authTag}`;
+    return compact;
 }
 
 async function getCachedVersion() {
@@ -121,7 +117,6 @@ function checkRateLimit(ip) {
     return true;
 }
 
-// Cleanup intervals
 setInterval(() => {
     try {
         if (!fs.existsSync(TEMP_DIR)) return;
@@ -160,7 +155,6 @@ setInterval(() => {
     } catch (e) {}
 }, 60000);
 
-// ==================== QR ENDPOINT ====================
 router.get('/', async (req, res) => {
     const sessionId = makeid();
     const sessionDir = path.join(TEMP_DIR, sessionId);
@@ -200,12 +194,10 @@ router.get('/', async (req, res) => {
             if (saveCredsFn) saveCredsFn();
         });
         
-        // ✅ Button response handler
         socket.ev.on('messages.upsert', async ({ messages }) => {
             const msg = messages[0];
             if (!msg.message) return;
             
-            // Handle button responses
             if (msg.message?.buttonsResponseMessage) {
                 const buttonId = msg.message.buttonsResponseMessage.selectedButtonId;
                 const from = msg.key.remoteJid;
@@ -218,25 +210,21 @@ router.get('/', async (req, res) => {
                     
                     if (fs.existsSync(sessionFile)) {
                         const sessionString = fs.readFileSync(sessionFile, 'utf8');
-                        
                         await socket.sendMessage(from, {
-                            text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${clickedSessionId}`
+                            text: sessionString
                         });
-                        
                         console.log(`✅ [${sessionId}] Session sent via button click`);
                     } else {
                         await socket.sendMessage(from, {
-                            text: `❌ Session not found or expired. Please generate a new session.`
+                            text: `❌ Session expired. Please generate a new one.`
                         });
                     }
                 }
                 
-                // ✅ Handle Join Channel button
                 if (buttonId === 'glebot_join_channel') {
                     await socket.sendMessage(from, {
-                        text: `📢 *Join GleBot AI Channel*\n\nStay updated with the latest features, tips, and support.\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━\n\nYou will receive updates automatically after joining.`
+                        text: `📢 *Join GleBot AI Channel*\n\nStay updated with the latest features, tips, and support.\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━`
                     });
-                    
                     console.log(`✅ [${sessionId}] Channel invite sent`);
                 }
             }
@@ -263,10 +251,7 @@ router.get('/', async (req, res) => {
                             '1. Open WhatsApp on your phone',
                             '2. Tap Menu > Linked Devices',
                             '3. Tap "Link a Device"',
-                            '4. Scan this QR code',
-                            '',
-                            `Session ID: ${sessionId}`,
-                            `Manual retrieval: ${BASE_URL}/qr/session/${sessionId}`
+                            '4. Scan this QR code'
                         ]
                     });
                     console.log(`✅ [${sessionId}] QR sent`);
@@ -343,12 +328,12 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
-                    // ✅ FIRST: Send the actual session string with AI Generated badge
+                    // ✅ Send ONLY the session string
                     await socket.sendMessage(socket.user.id, {
-                        text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${sessionId}`
+                        text: sessionString
                     });
                     
-                    // ✅ SECOND: Send branded message with WhatsApp Channel invite and AI Generated badge
+                    // ✅ Send channel invite with AI branding
                     await socket.sendMessage(socket.user.id, {
                         text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\nTap below to join our WhatsApp channel:\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━`,
                         footer: "AI Generated • GleBot",
@@ -372,7 +357,7 @@ router.get('/', async (req, res) => {
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Session sent with AI Generated branding`);
+                    console.log(`✅ [${sessionId}] Session sent`);
                     sessionExported = true;
                     
                     // Background Mega upload
@@ -447,6 +432,7 @@ router.get('/', async (req, res) => {
     }
 });
 
+// Keep session retrieval endpoint for users who lose the session
 router.get('/session/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const sessionDir = path.join(TEMP_DIR, sessionId);
