@@ -6,15 +6,33 @@ import { uploadSession } from './mega.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
+import cors from 'cors';
 
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// CORS protection
+router.use(cors({
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+    methods: ['GET'],
+    credentials: true
+}));
+
 const TEMP_DIR = path.join(__dirname, 'temp_sessions');
+const MAX_SESSIONS = 100;
+const CLEANUP_AGE = 3600000; // 1 hour
 
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+// Global version cache
+let cachedVersion = null;
+let versionCacheTime = 0;
+const VERSION_CACHE_TTL = 3600000; // 1 hour
 
-const activeSessions = new Map();
+// Encryption warning - log once
+let encryptionWarningLogged = false;
+
+// Rate limiting
+const rateLimits = new Map();
+const BASE_URL = process.env.BASE_URL || 'https://gle-session-2.onrender.com';
 
 function makeid() {
     return crypto.randomBytes(8).toString('hex');
@@ -24,86 +42,209 @@ function removeFile(filePath) {
     try { if (fs.existsSync(filePath)) fs.rmSync(filePath, { recursive: true, force: true }); } catch (e) {}
 }
 
-// ==================== SESSION EXPORT FUNCTIONS ====================
 function collectSessionFiles(sessionDir) {
-    const sessionData = {};
-    const files = fs.readdirSync(sessionDir);
-    
-    for (const file of files) {
-        const filePath = path.join(sessionDir, file);
-        const stat = fs.statSync(filePath);
-        if (stat.isFile()) {
-            const content = fs.readFileSync(filePath);
-            sessionData[file] = content.toString('base64');
+    try {
+        const sessionData = {};
+        const files = fs.readdirSync(sessionDir);
+        
+        for (const file of files) {
+            const filePath = path.join(sessionDir, file);
+            const stat = fs.statSync(filePath);
+            if (stat.isFile()) {
+                const content = fs.readFileSync(filePath);
+                sessionData[file] = content.toString('base64');
+            }
         }
+        return sessionData;
+    } catch (err) {
+        console.error(`Failed to collect session files:`, err);
+        return {};
     }
-    return sessionData;
 }
 
 function encryptSession(sessionData, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
-    if (!ENCRYPTION_KEY) return JSON.stringify(sessionData);
+    if (!ENCRYPTION_KEY) {
+        if (!encryptionWarningLogged) {
+            console.warn(`⚠️ Encryption disabled - sessions will be plain text! Set ENCRYPTION_KEY in environment.`);
+            encryptionWarningLogged = true;
+        }
+        return JSON.stringify(sessionData);
+    }
     
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
     const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
     let encrypted = cipher.update(JSON.stringify(sessionData), 'utf8', 'base64');
     encrypted += cipher.final('base64');
+    const authTag = cipher.getAuthTag().toString('base64');
     
-    const package_ = { iv: iv.toString('base64'), data: encrypted, sessionId };
+    const package_ = { iv: iv.toString('base64'), data: encrypted, authTag, sessionId };
     return Buffer.from(JSON.stringify(package_)).toString('base64');
 }
+
+async function getCachedVersion() {
+    try {
+        const now = Date.now();
+        if (cachedVersion && (now - versionCacheTime) < VERSION_CACHE_TTL) {
+            return cachedVersion;
+        }
+        const { version } = await fetchLatestBaileysVersion();
+        cachedVersion = version;
+        versionCacheTime = now;
+        return version;
+    } catch (err) {
+        console.error('Failed to fetch version, using cached:', err.message);
+        return cachedVersion || [2, 3000, 1035194821];
+    }
+}
+
+function checkRateLimit(ip) {
+    const now = Date.now();
+    const limit = rateLimits.get(ip) || [];
+    const recent = limit.filter(time => now - time < 60000);
+    if (recent.length >= 3) {
+        return false;
+    }
+    recent.push(now);
+    rateLimits.set(ip, recent);
+    return true;
+}
+
+// Cleanup intervals
+setInterval(() => {
+    try {
+        if (!fs.existsSync(TEMP_DIR)) return;
+        
+        const files = fs.readdirSync(TEMP_DIR);
+        const now = Date.now();
+        
+        for (const file of files) {
+            const filePath = path.join(TEMP_DIR, file);
+            try {
+                const stat = fs.statSync(filePath);
+                if (now - stat.mtimeMs > CLEANUP_AGE) {
+                    removeFile(filePath);
+                    console.log(`🧹 Cleaned old session: ${file}`);
+                }
+            } catch (e) {
+                // File may have been deleted
+            }
+        }
+        
+        const sessions = fs.readdirSync(TEMP_DIR);
+        if (sessions.length > MAX_SESSIONS) {
+            sessions.sort((a, b) => {
+                try {
+                    const statA = fs.statSync(path.join(TEMP_DIR, a));
+                    const statB = fs.statSync(path.join(TEMP_DIR, b));
+                    return statA.mtimeMs - statB.mtimeMs;
+                } catch (e) {
+                    return 0;
+                }
+            });
+            
+            const toDelete = sessions.slice(0, sessions.length - MAX_SESSIONS);
+            for (const session of toDelete) {
+                removeFile(path.join(TEMP_DIR, session));
+                console.log(`🧹 Removed old session (limit): ${session}`);
+            }
+        }
+    } catch (e) {
+        console.log("Cleanup error:", e.message);
+    }
+}, 600000);
+
+// Rate limit cleanup
+setInterval(() => {
+    try {
+        const now = Date.now();
+        for (const [ip, times] of rateLimits.entries()) {
+            const recent = times.filter(t => now - t < 60000);
+            if (recent.length === 0) rateLimits.delete(ip);
+            else rateLimits.set(ip, recent);
+        }
+    } catch (e) {
+        console.log("Rate limit cleanup error:", e.message);
+    }
+}, 60000);
 
 // ==================== QR ENDPOINT ====================
 router.get('/', async (req, res) => {
     const sessionId = makeid();
     const sessionDir = path.join(TEMP_DIR, sessionId);
     
-    console.log(`\n🔷 [${sessionId}] QR session started`);
+    const clientIp = req.ip || req.connection.remoteAddress;
+    if (!checkRateLimit(clientIp)) {
+        return res.status(429).json({ 
+            success: false, 
+            error: 'Rate limited. Please wait a minute.',
+            sessionId 
+        });
+    }
+    
+    console.log(`\n🔷 [${sessionId}] QR session started from ${clientIp}`);
+    
+    let sock = null;
+    let qrSent = false;
+    let sessionExported = false;
+    let userConnected = false;
+    let credsUpdateCount = 0;
+    let cleanupTimer = null;
+    let cleaned = false;
+    
+    const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        
+        console.log(`🧹 [${sessionId}] Starting cleanup...`);
+        
+        if (cleanupTimer) clearTimeout(cleanupTimer);
+        
+        if (sock) {
+            sock.end(); // This removes listeners internally
+        }
+        
+        setTimeout(() => {
+            removeFile(sessionDir);
+            console.log(`🧹 [${sessionId}] Cleanup complete`);
+        }, 1000);
+    };
     
     try {
         fs.mkdirSync(sessionDir, { recursive: true });
         
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        const { version } = await fetchLatestBaileysVersion();
+        const version = await getCachedVersion();
         
-        const sock = makeWASocket({
+        const onCredsUpdate = () => {
+            credsUpdateCount++;
+            console.log(`💾 [${sessionId}] creds.update #${credsUpdateCount}`);
+            saveCreds();
+        };
+        
+        sock = makeWASocket({
             version,
             auth: state,
             printQRInTerminal: false,
             browser: Browsers.windows("Chrome"),
             syncFullHistory: false,
-            markOnlineOnConnect: false,
+            markOnlineOnConnect: true,
             keepAliveIntervalMs: 30000,
             defaultQueryTimeoutMs: 60000,
-            connectTimeoutMs: 60000,
-            shouldSyncHistoryMessage: false,
-            emitOwnEvents: true
+            connectTimeoutMs: 60000
         });
         
-        sock.ev.on('creds.update', saveCreds);
-        
-        activeSessions.set(sessionId, { sock, sessionDir, status: 'waiting' });
-        
-        let qrSent = false;
-        let responseSent = false;
-        let loggedIn = false;
-        let apiResponseSent = false;
-        let pairingConfigured = false;
-        let reconnectTimer = null;
-        
-        // QR timeout: 3 minutes
-        const QR_TIMEOUT = 180000;
-        const RECONNECT_TIMEOUT = 30000;
+        sock.ev.on('creds.update', onCredsUpdate);
         
         sock.ev.on('connection.update', async (update) => {
-            const { connection, qr, lastDisconnect, isNewLogin } = update;
+            if (sessionExported || cleaned) return;
             
-            console.log(`[${sessionId}] State:`, connection || 'waiting', isNewLogin ? '(new login)' : '');
+            const { connection, qr } = update;
+            console.log(`[${sessionId}] State:`, connection || 'waiting');
             
-            // QR CODE GENERATED
-            if (qr && !qrSent && !responseSent) {
+            if (qr && !qrSent && !res.headersSent && !cleaned) {
                 qrSent = true;
                 try {
                     const qrImage = await QRCode.toDataURL(qr);
@@ -112,89 +253,50 @@ router.get('/', async (req, res) => {
                         success: true, 
                         qr: qrImage, 
                         sessionId,
-                        message: 'Scan with WhatsApp',
+                        message: 'Scan QR with WhatsApp',
                         instructions: [
                             '1. Open WhatsApp on your phone',
                             '2. Tap Menu > Linked Devices',
                             '3. Tap "Link a Device"',
                             '4. Scan this QR code',
                             '',
-                            `⏱️ QR expires in ${QR_TIMEOUT/1000} seconds`
+                            '⏱️ QR expires in 3 minutes',
+                            '',
+                            `Session ID: ${sessionId} (save this for manual retrieval)`,
+                            `Manual retrieval: ${BASE_URL}/qr/session/${sessionId}`
                         ]
                     });
-                    responseSent = true;
-                    console.log(`✅ [${sessionId}] QR sent to client (timeout: ${QR_TIMEOUT/1000}s)`);
-                    
-                    setTimeout(() => {
-                        if (!loggedIn && !pairingConfigured) {
-                            console.log(`⏰ [${sessionId}] QR timeout - cleaning up`);
-                            sock.ws?.close();
-                            activeSessions.delete(sessionId);
-                            removeFile(sessionDir);
-                        }
-                    }, QR_TIMEOUT);
+                    console.log(`✅ [${sessionId}] QR sent`);
                     
                 } catch (err) {
                     console.error(`QR error:`, err);
+                    if (!res.headersSent) {
+                        res.status(500).json({ success: false, error: 'QR generation failed', sessionId });
+                    }
+                    cleanup();
                 }
             }
             
-            // Detect QR scan
-            if (isNewLogin) {
-                console.log(`📱 [${sessionId}] QR SCANNED!`);
-                pairingConfigured = true;
+            if (connection === 'close' && !sessionExported) {
+                console.log(`🔴 [${sessionId}] Connection closed without export`);
+                cleanup();
             }
             
-            // Handle close - expected restart after scan
-            if (connection === 'close') {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                console.log(`[${sessionId}] Closed with code:`, statusCode);
+            if (connection === 'open' && sock.user && !userConnected) {
+                userConnected = true;
+                console.log(`🎉 [${sessionId}] USER CONNECTED!`);
+                console.log(`👤 User: ${sock.user.id}`);
                 
-                if (pairingConfigured && !loggedIn) {
-                    console.log(`🔄 [${sessionId}] Expected restart after scan - waiting for reconnect...`);
-                    if (reconnectTimer) clearTimeout(reconnectTimer);
-                    reconnectTimer = setTimeout(() => {
-                        if (!loggedIn) {
-                            console.log(`⏰ [${sessionId}] Reconnect timeout - cleaning up`);
-                            sock.ws?.close();
-                            activeSessions.delete(sessionId);
-                            removeFile(sessionDir);
-                        }
-                    }, RECONNECT_TIMEOUT);
-                    return;
-                }
-                
-                if (!loggedIn && !pairingConfigured) {
-                    console.log(`[${sessionId}] Connection closed without scan - cleaning up`);
-                    activeSessions.delete(sessionId);
-                    removeFile(sessionDir);
-                }
-            }
-            
-            // ✅ FINAL LOGIN DETECTION - Check for creds.registered OR sock.user
-            if (!loggedIn && (sock.authState?.creds?.registered || sock.user)) {
-                console.log(`🎉 [${sessionId}] LOGIN SUCCESSFUL!`);
-                console.log(`👤 User: ${sock.user?.id || 'unknown'}`);
-                
-                if (reconnectTimer) {
-                    clearTimeout(reconnectTimer);
-                    reconnectTimer = null;
-                }
-                
-                loggedIn = true;
-                
-                // Force save credentials
-                console.log(`💾 [${sessionId}] Forcing credentials save...`);
-                await saveCreds();
-                
-                // Wait for files to write
-                console.log(`⏳ [${sessionId}] Waiting 4 seconds for files to stabilize...`);
-                await delay(4000);
+                console.log(`⏳ [${sessionId}] Waiting 5 seconds for files to write...`);
+                await delay(5000);
                 
                 try {
-                    // Collect session files
                     console.log(`📁 [${sessionId}] Collecting session files...`);
                     const sessionFiles = collectSessionFiles(sessionDir);
+                    
+                    if (!sessionFiles["creds.json"]) {
+                        throw new Error('creds.json missing from session');
+                    }
                     
                     if (Object.keys(sessionFiles).length === 0) {
                         throw new Error('No session files found');
@@ -202,104 +304,110 @@ router.get('/', async (req, res) => {
                     
                     const sessionPackage = {
                         id: sessionId,
-                        user: sock.user?.id || 'unknown',
+                        user: sock.user.id,
                         timestamp: Date.now(),
                         files: sessionFiles
                     };
                     
-                    // Encrypt session
                     console.log(`🔐 [${sessionId}] Encrypting session...`);
                     const sessionString = encryptSession(sessionPackage, sessionId);
                     
-                    if (!apiResponseSent && sock.user) {
-                        console.log(`📤 [${sessionId}] Sending session via WhatsApp...`);
-                        const userJid = sock.user.id;
-                        
-                        await sock.sendMessage(userJid, {
-                            text: `🔐 *GLE Session String*\n\nCopy this entire string for session restore:\n\n\`${sessionString}\``
+                    const sessionFile = path.join(sessionDir, 'session.txt');
+                    fs.writeFileSync(sessionFile, sessionString);
+                    
+                    console.log(`📤 [${sessionId}] Sending session to user...`);
+                    
+                    try {
+                        await sock.sendMessage(sock.user.id, {
+                            text: `🔐 *GLE Session String*\n\n\`${sessionString}\``
                         });
                         console.log(`✅ [${sessionId}] Session string sent`);
                         
-                        const credsPath = path.join(sessionDir, 'creds.json');
-                        if (fs.existsSync(credsPath)) {
-                            await sock.sendMessage(userJid, {
-                                document: fs.readFileSync(credsPath),
-                                mimetype: 'application/json',
-                                fileName: 'creds.json',
-                                caption: '📁 Your WhatsApp session credentials file'
-                            });
-                            console.log(`✅ [${sessionId}] creds.json sent`);
-                        }
-                        
-                        await sock.sendMessage(userJid, {
-                            text: `✅ *Login Complete!*\n\nSession saved and sent.`
+                        await sock.sendMessage(sock.user.id, {
+                            text: `✅ *Session Export Complete!*\n\nSession ID: \`${sessionId}\`\n\nManual retrieval: ${BASE_URL}/qr/session/${sessionId}`
                         });
                         
-                        apiResponseSent = true;
-                    }
-                    
-                    // Mega upload in background
-                    (async () => {
-                        try {
-                            console.log(`☁️ [${sessionId}] Background Mega upload...`);
-                            const megaUrl = await uploadSession(sessionString, sessionId);
-                            if (megaUrl && !megaUrl.startsWith('local://')) {
-                                console.log(`✅ [${sessionId}] Mega upload complete`);
-                                if (sock.user) {
-                                    await sock.sendMessage(sock.user.id, {
-                                        text: `💾 *Mega Backup*\n\n${megaUrl}`
-                                    });
+                        console.log(`✅ [${sessionId}] Session sent to user`);
+                        sessionExported = true;
+                        
+                        // Mega upload - no sessionExported check
+                        (async () => {
+                            try {
+                                console.log(`☁️ [${sessionId}] Background Mega upload...`);
+                                const megaUrl = await uploadSession(sessionString, sessionId);
+                                if (megaUrl && !megaUrl.startsWith('local://')) {
+                                    console.log(`✅ [${sessionId}] Mega upload complete`);
+                                    if (sock && sock.user) {
+                                        try {
+                                            await sock.sendMessage(sock.user.id, {
+                                                text: `💾 *Mega Backup*\n\n${megaUrl}`
+                                            });
+                                            console.log(`✅ [${sessionId}] Mega link sent`);
+                                        } catch (e) {
+                                            console.log(`⚠️ [${sessionId}] Could not send Mega link: ${e.message}`);
+                                        }
+                                    }
                                 }
+                            } catch (e) {
+                                console.log(`⚠️ [${sessionId}] Mega upload failed: ${e.message}`);
                             }
-                        } catch (e) {
-                            console.log(`⚠️ [${sessionId}] Mega upload failed: ${e.message}`);
-                        }
-                    })();
-                    
-                    // Cleanup
-                    setTimeout(() => {
-                        console.log(`🔌 [${sessionId}] Closing session socket...`);
-                        sock.ws?.close();
-                        setTimeout(() => {
-                            activeSessions.delete(sessionId);
-                            removeFile(sessionDir);
-                            console.log(`🧹 [${sessionId}] Cleanup complete`);
-                        }, 5000);
-                    }, 5000);
+                        })();
+                        
+                        setTimeout(() => cleanup(), 60000);
+                        
+                    } catch (err) {
+                        console.error(`❌ [${sessionId}] Failed to send:`, err);
+                        throw err;
+                    }
                     
                 } catch (err) {
-                    console.error(`❌ [${sessionId}] Session processing failed:`, err);
-                    if (sock.user) {
-                        try {
-                            await sock.sendMessage(sock.user.id, {
-                                text: `❌ *Error*\n\n${err.message}`
-                            });
-                        } catch (e) {}
-                    }
-                    sock.ws?.close();
-                    activeSessions.delete(sessionId);
-                    removeFile(sessionDir);
+                    console.error(`❌ [${sessionId}] Export failed:`, err);
+                    cleanup();
                 }
             }
         });
         
-        // QR generation timeout
         setTimeout(() => {
-            if (!qrSent && !responseSent) {
-                res.status(504).json({ success: false, error: 'QR generation timeout' });
-                sock.ws?.close();
-                activeSessions.delete(sessionId);
-                removeFile(sessionDir);
+            if (!qrSent && !res.headersSent && !cleaned) {
+                res.status(504).json({ success: false, error: 'QR generation timeout', sessionId });
+                cleanup();
             }
         }, 30000);
         
+        setTimeout(() => {
+            if (!sessionExported && !cleaned) {
+                console.log(`⏰ [${sessionId}] QR timeout`);
+                cleanup();
+            }
+        }, 180000);
+        
     } catch (error) {
         console.error(`Fatal:`, error);
-        if (!res.headersSent) {
-            res.status(500).json({ success: false, error: error.message });
+        if (!res.headersSent && !cleaned) {
+            res.status(500).json({ success: false, error: error.message, sessionId });
         }
-        removeFile(sessionDir);
-        activeSessions.delete(sessionId);
+        cleanup();
+    }
+});
+
+// Session retrieval endpoint with optional key
+router.get('/session/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
+    const { key } = req.query;
+    const expectedKey = process.env.SESSION_RETRIEVAL_KEY;
+    
+    if (expectedKey && key !== expectedKey) {
+        return res.status(401).json({ success: false, error: 'Invalid or missing key' });
+    }
+    
+    const sessionDir = path.join(TEMP_DIR, sessionId);
+    const sessionFile = path.join(sessionDir, 'session.txt');
+    
+    if (fs.existsSync(sessionFile)) {
+        const sessionString = fs.readFileSync(sessionFile, 'utf8');
+        res.json({ success: true, sessionString, sessionId });
+    } else {
+        res.status(404).json({ success: false, error: 'Session not found or not ready', sessionId });
     }
 });
 
