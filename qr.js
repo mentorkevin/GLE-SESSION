@@ -162,9 +162,11 @@ router.get('/', async (req, res) => {
     let qrSent = false;
     let sessionExported = false;
     let userConnected = false;
-    let restartDetected = false;
     let cleaned = false;
     let reconnectTimer = null;
+    let authState = null;
+    let saveCredsFn = null;
+    let version = null;
     
     const cleanup = () => {
         if (cleaned) return;
@@ -178,36 +180,14 @@ router.get('/', async (req, res) => {
         setTimeout(() => removeFile(sessionDir), 5000);
     };
     
-    try {
-        fs.mkdirSync(sessionDir, { recursive: true });
+    // ✅ Function to attach event handlers to a socket
+    const attachEvents = (socket) => {
+        socket.ev.on('creds.update', () => {
+            console.log(`💾 [${sessionId}] creds.update`);
+            if (saveCredsFn) saveCredsFn();
+        });
         
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        const version = await getCachedVersion();
-        
-        const createSocket = () => {
-            const newSock = makeWASocket({
-                version,
-                auth: state,
-                printQRInTerminal: false,
-                browser: Browsers.ubuntu("Chrome"),
-                syncFullHistory: false,
-                markOnlineOnConnect: true,
-                keepAliveIntervalMs: 30000,
-                defaultQueryTimeoutMs: 60000,
-                connectTimeoutMs: 60000
-            });
-            
-            newSock.ev.on('creds.update', () => {
-                console.log(`💾 [${sessionId}] creds.update`);
-                saveCreds();
-            });
-            
-            return newSock;
-        };
-        
-        sock = createSocket();
-        
-        sock.ev.on('connection.update', async (update) => {
+        socket.ev.on('connection.update', async (update) => {
             if (sessionExported || cleaned) return;
             
             const { connection, qr, lastDisconnect } = update;
@@ -244,12 +224,43 @@ router.get('/', async (req, res) => {
                 }
             }
             
-            // ✅ Detect 515 restart
+            // ✅ Detect 515 restart - RECREATE SOCKET
             if (connection === 'close' && statusCode === 515 && !sessionExported && !userConnected) {
-                console.log(`🔄 [${sessionId}] Restart detected - waiting for reconnect...`);
-                restartDetected = true;
+                console.log(`🔄 [${sessionId}] Restart detected - recreating socket...`);
                 
                 if (reconnectTimer) clearTimeout(reconnectTimer);
+                
+                // Recreate socket with existing auth state after delay
+                setTimeout(() => {
+                    if (!userConnected && !sessionExported && !cleaned) {
+                        console.log(`🔁 [${sessionId}] Creating new socket after 515...`);
+                        
+                        // Remove old listeners and close old socket
+                        if (sock) {
+                            sock.ev.removeAllListeners();
+                            try { sock.end(); } catch (e) {}
+                        }
+                        
+                        // Create new socket with same auth state
+                        const newSock = makeWASocket({
+                            version,
+                            auth: authState,
+                            printQRInTerminal: false,
+                            browser: Browsers.ubuntu("Chrome"),
+                            syncFullHistory: false,
+                            markOnlineOnConnect: true,
+                            keepAliveIntervalMs: 30000,
+                            defaultQueryTimeoutMs: 60000,
+                            connectTimeoutMs: 60000
+                        });
+                        
+                        sock = newSock;
+                        attachEvents(sock);
+                        console.log(`✅ [${sessionId}] New socket created, waiting for connection...`);
+                    }
+                }, 3000);
+                
+                // Set overall reconnect timeout
                 reconnectTimer = setTimeout(() => {
                     if (!userConnected && !sessionExported && !cleaned) {
                         console.log(`⏰ [${sessionId}] Reconnect timeout`);
@@ -260,10 +271,10 @@ router.get('/', async (req, res) => {
             }
             
             // ✅ Login detected
-            if (connection === 'open' && sock?.user?.id && !userConnected) {
+            if (connection === 'open' && socket?.user?.id && !userConnected) {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
-                console.log(`👤 User: ${sock.user.id}`);
+                console.log(`👤 User: ${socket.user.id}`);
                 
                 if (reconnectTimer) clearTimeout(reconnectTimer);
                 
@@ -280,7 +291,7 @@ router.get('/', async (req, res) => {
                     
                     const sessionPackage = {
                         id: sessionId,
-                        user: sock.user.id,
+                        user: socket.user.id,
                         timestamp: Date.now(),
                         files: sessionFiles
                     };
@@ -293,16 +304,16 @@ router.get('/', async (req, res) => {
                     
                     // Send via WhatsApp
                     if (sessionString.length > 60000) {
-                        await sock.sendMessage(sock.user.id, {
+                        await socket.sendMessage(socket.user.id, {
                             text: `🔐 Session too large! Use manual retrieval:\n${BASE_URL}/qr/session/${sessionId}`
                         });
                     } else {
-                        await sock.sendMessage(sock.user.id, {
+                        await socket.sendMessage(socket.user.id, {
                             text: `🔐 *GLE Session String*\n\n\`${sessionString}\``
                         });
                     }
                     
-                    await sock.sendMessage(sock.user.id, {
+                    await socket.sendMessage(socket.user.id, {
                         text: `✅ *Session Complete!*\n\nSession ID: \`${sessionId}\``
                     });
                     
@@ -313,8 +324,8 @@ router.get('/', async (req, res) => {
                     (async () => {
                         try {
                             const megaUrl = await uploadSession(sessionString, sessionId);
-                            if (megaUrl && !megaUrl.startsWith('local://') && sock?.user) {
-                                await sock.sendMessage(sock.user.id, {
+                            if (megaUrl && !megaUrl.startsWith('local://') && socket?.user) {
+                                await socket.sendMessage(socket.user.id, {
                                     text: `💾 *Mega Backup*\n\n${megaUrl}`
                                 });
                             }
@@ -330,10 +341,35 @@ router.get('/', async (req, res) => {
             }
             
             // Handle other closes
-            if (connection === 'close' && !sessionExported && !restartDetected) {
+            if (connection === 'close' && !sessionExported && !userConnected) {
+                console.log(`🔴 [${sessionId}] Connection closed without export`);
                 cleanup();
             }
         });
+    };
+    
+    try {
+        fs.mkdirSync(sessionDir, { recursive: true });
+        
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        authState = state;
+        saveCredsFn = saveCreds;
+        version = await getCachedVersion();
+        
+        // Create initial socket
+        sock = makeWASocket({
+            version,
+            auth: authState,
+            printQRInTerminal: false,
+            browser: Browsers.ubuntu("Chrome"),
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
+            keepAliveIntervalMs: 30000,
+            defaultQueryTimeoutMs: 60000,
+            connectTimeoutMs: 60000
+        });
+        
+        attachEvents(sock);
         
         // QR timeout
         setTimeout(() => {
