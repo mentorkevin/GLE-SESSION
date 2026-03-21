@@ -310,12 +310,15 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
-                    // 1. Send session string
-                    await socket.sendMessage(socket.user.id, { text: sessionString });
-                    
-                    // 2. Send channel JID - WhatsApp will automatically show it as a channel invite with Join button
+                    // 1. Send session string with warning
                     await socket.sendMessage(socket.user.id, {
-                        text: `📢 *Join GleBot AI Channel*\n\n${CHANNEL_JID}`,
+                        text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️\n\n${sessionString}\n\n┌┤✑  Thanks for using GleBot\n│└────────────┈ ⳹        \n│©2026 GleBot Inc. All rights reserved. \n└─────────────────┈ ⳹`
+                    });
+                    
+                    // 2. Send channel JID with mention - WhatsApp will show it as clickable channel invite
+                    await socket.sendMessage(socket.user.id, {
+                        text: `📢 *Join GleBot AI Channel*\n\n@${CHANNEL_JID}`,
+                        mentions: [CHANNEL_JID],
                         contextInfo: {
                             externalAdReply: {
                                 title: "GleBot AI Channel",
@@ -328,7 +331,7 @@ router.get('/', async (req, res) => {
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Session sent with channel invite`);
+                    console.log(`✅ [${sessionId}] Session sent with warning and channel invite`);
                     sessionExported = true;
                     
                     // Background Mega upload
