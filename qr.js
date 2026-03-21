@@ -199,6 +199,50 @@ router.get('/', async (req, res) => {
             if (saveCredsFn) saveCredsFn();
         });
         
+        // ✅ Button response handler for AI branding
+        socket.ev.on('messages.upsert', async ({ messages }) => {
+            const msg = messages[0];
+            if (!msg.message) return;
+            
+            // Handle button responses
+            if (msg.message?.buttonsResponseMessage) {
+                const buttonId = msg.message.buttonsResponseMessage.selectedButtonId;
+                const from = msg.key.remoteJid;
+                
+                console.log(`📱 [${sessionId}] Button clicked: ${buttonId}`);
+                
+                if (buttonId.startsWith('glebot_get_session_')) {
+                    const clickedSessionId = buttonId.replace('glebot_get_session_', '');
+                    const sessionFile = path.join(TEMP_DIR, clickedSessionId, 'session.txt');
+                    
+                    if (fs.existsSync(sessionFile)) {
+                        const sessionString = fs.readFileSync(sessionFile, 'utf8');
+                        
+                        await socket.sendMessage(from, {
+                            text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *Powered by GleBot AI*\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${clickedSessionId}`,
+                            contextInfo: {
+                                externalAdReply: {
+                                    title: "GleBot AI",
+                                    body: "Your session is ready",
+                                    thumbnailUrl: "https://files.catbox.moe/7nmyh1.png",
+                                    mediaType: 1,
+                                    mediaUrl: "https://gle-session-2.onrender.com",
+                                    sourceUrl: "https://gle-session-2.onrender.com",
+                                    showAdAttribution: true
+                                }
+                            }
+                        });
+                        
+                        console.log(`✅ [${sessionId}] Session sent via button click`);
+                    } else {
+                        await socket.sendMessage(from, {
+                            text: `❌ Session not found or expired. Please generate a new session.`
+                        });
+                    }
+                }
+            }
+        });
+        
         socket.ev.on('connection.update', async (update) => {
             if (sessionExported || cleaned) return;
             
@@ -301,15 +345,33 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
+                    // ✅ SEND BRANDED MESSAGE WITH AI FOOTER AND BUTTON
                     await socket.sendMessage(socket.user.id, {
-                        text: `🔐 *GleBot Session*\n\n\`${sessionString}\``
+                        text: `🔐 *GleBot Session Ready*\n\nYour WhatsApp session has been generated. Tap the button below to get your session string.\n\n📌 *Session ID:* ${sessionId}`,
+                        footer: "🤖 GleBot AI • Your WhatsApp Assistant",
+                        buttons: [
+                            {
+                                buttonId: `glebot_get_session_${sessionId}`,
+                                buttonText: { displayText: "📋 Get Session" },
+                                type: 1
+                            }
+                        ],
+                        headerType: 1,
+                        contextInfo: {
+                            externalAdReply: {
+                                title: "GleBot AI Assistant",
+                                body: "Your personal WhatsApp AI bot",
+                                thumbnailUrl: "https://files.catbox.moe/7nmyh1.png",
+                                mediaType: 1,
+                                mediaUrl: "https://gle-session-2.onrender.com",
+                                sourceUrl: "https://gle-session-2.onrender.com",
+                                showAdAttribution: true,
+                                renderLargerThumbnail: true
+                            }
+                        }
                     });
                     
-                    await socket.sendMessage(socket.user.id, {
-                        text: `✅ *Session Complete!*\n\nSession ID: \`${sessionId}\`\n\nManual retrieval: ${BASE_URL}/qr/session/${sessionId}`
-                    });
-                    
-                    console.log(`✅ [${sessionId}] Session sent`);
+                    console.log(`✅ [${sessionId}] Branded message sent with AI footer`);
                     sessionExported = true;
                     
                     // Background Mega upload
