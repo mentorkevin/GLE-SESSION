@@ -220,7 +220,7 @@ router.get('/', async (req, res) => {
                         const sessionString = fs.readFileSync(sessionFile, 'utf8');
                         
                         await socket.sendMessage(from, {
-                            text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *Powered by GleBot AI*\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${clickedSessionId}`
+                            text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${clickedSessionId}`
                         });
                         
                         console.log(`✅ [${sessionId}] Session sent via button click`);
@@ -234,7 +234,7 @@ router.get('/', async (req, res) => {
                 // ✅ Handle Join Channel button
                 if (buttonId === 'glebot_join_channel') {
                     await socket.sendMessage(from, {
-                        text: `📢 *Join GleBot AI Channel*\n\nStay updated with the latest features, tips, and support.\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *Powered by GleBot AI*\n━━━━━━━━━━━━━━━━━━━━\n\nYou will receive updates automatically after joining.`
+                        text: `📢 *Join GleBot AI Channel*\n\nStay updated with the latest features, tips, and support.\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━\n\nYou will receive updates automatically after joining.`
                     });
                     
                     console.log(`✅ [${sessionId}] Channel invite sent`);
@@ -343,15 +343,15 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
-                    // ✅ FIRST: Send the actual session string
+                    // ✅ FIRST: Send the actual session string with AI Generated badge
                     await socket.sendMessage(socket.user.id, {
-                        text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *Powered by GleBot AI*\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${sessionId}`
+                        text: `🔐 *GleBot Session String*\n\n\`${sessionString}\`\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━\n\n📌 *Session ID:* ${sessionId}`
                     });
                     
-                    // ✅ SECOND: Send branded message with WhatsApp Channel invite
+                    // ✅ SECOND: Send branded message with WhatsApp Channel invite and AI Generated badge
                     await socket.sendMessage(socket.user.id, {
-                        text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\nTap below to join our WhatsApp channel:`,
-                        footer: "🤖 GleBot AI",
+                        text: `📢 *Join GleBot AI Community!*\n\nStay updated with the latest features, tips, and support.\n\nTap below to join our WhatsApp channel:\n\n━━━━━━━━━━━━━━━━━━━━\n🤖 *AI Generated Content*\n⚡ Powered by GleBot AI\n━━━━━━━━━━━━━━━━━━━━`,
+                        footer: "AI Generated • GleBot",
                         buttons: [
                             {
                                 buttonId: `glebot_join_channel`,
@@ -362,8 +362,8 @@ router.get('/', async (req, res) => {
                         headerType: 1,
                         contextInfo: {
                             externalAdReply: {
-                                title: "GleBot AI Channel",
-                                body: "Join our community",
+                                title: "GleBot AI (AI Generated)",
+                                body: "AI-powered WhatsApp assistant",
                                 thumbnailUrl: "https://files.catbox.moe/7nmyh1.png",
                                 mediaType: 1,
                                 sourceUrl: "https://gle-session-2.onrender.com",
@@ -372,7 +372,7 @@ router.get('/', async (req, res) => {
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Session sent with channel invite`);
+                    console.log(`✅ [${sessionId}] Session sent with AI Generated branding`);
                     sessionExported = true;
                     
                     // Background Mega upload
