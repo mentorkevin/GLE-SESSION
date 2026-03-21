@@ -5,10 +5,8 @@ import path from 'path';
 import dotenv from 'dotenv';
 import fs from 'fs';
 
-// Load environment variables
 dotenv.config();
 
-// Import routers
 import pairRouter from './pair.js';
 import qrRouter from './qr.js';
 
@@ -16,31 +14,29 @@ const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = process.env.PORT || 8000;
+// ✅ Use Render's PORT or fallback to 10000
+const PORT = process.env.PORT || 10000;
 
-// Trust proxy for correct IP on Render
 app.set('trust proxy', true);
 
-// Increase event listeners for WebSocket
 import('events').then(events => {
     events.EventEmitter.defaultMaxListeners = 500;
 });
 
-// Middleware
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.static(__dirname));
 
-// ==================== HEALTH CHECK ENDPOINT ====================
+// Health check - critical for Render
 app.get('/health', (req, res) => {
     res.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        port: PORT
     });
 });
 
-// ==================== STATUS ENDPOINT ====================
 app.get('/status', (req, res) => {
     res.json({
         success: true,
@@ -55,16 +51,13 @@ app.get('/status', (req, res) => {
     });
 });
 
-// ==================== WEB INTERFACE ====================
 app.get('/', (req, res) => {
     const htmlPath = path.join(__dirname, 'pair.html');
-    
     if (fs.existsSync(htmlPath)) {
         res.sendFile(htmlPath);
     } else {
         res.status(404).send(`
             <h1>pair.html not found</h1>
-            <p>The pair.html file is missing. Please ensure it exists in the root directory.</p>
             <p>Available endpoints:</p>
             <ul>
                 <li><a href="/qr">/qr</a> - QR Code Login</li>
@@ -76,14 +69,13 @@ app.get('/', (req, res) => {
     }
 });
 
-// ==================== API ROUTES ====================
 app.use('/pair', pairRouter);
 app.use('/qr', qrRouter);
 
-// ==================== START SERVER ====================
+// ✅ Force immediate port binding with error handling
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n🎬 [SERVER] GLE WhatsApp Linker starting...`);
-    console.log(`📡 Port: ${PORT}`);
+    console.log(`📡 Port: ${PORT} (bound to 0.0.0.0)`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`🔐 Encryption: ${process.env.ENCRYPTION_KEY ? 'enabled' : 'DISABLED'}`);
     console.log(`📦 Mega: ${process.env.MEGA_SESSION ? 'configured' : 'NOT CONFIGURED'}`);
@@ -96,30 +88,39 @@ const server = app.listen(PORT, '0.0.0.0', () => {
         console.log(`⚠️ pair.html not found - web interface will show error`);
     }
     
-    console.log(`\n✅ [SERVER] Ready!`);
-    console.log(`📍 Web Interface: http://localhost:${PORT}/ (serves pair.html)`);
-    console.log(`📍 QR Login: http://localhost:${PORT}/qr`);
-    console.log(`📍 Pairing: http://localhost:${PORT}/pair?number=+1234567890`);
+    console.log(`\n✅ [SERVER] Ready on port ${PORT}!`);
     console.log(`📍 Health check: http://localhost:${PORT}/health`);
-    console.log(`📍 Status: http://localhost:${PORT}/status`);
 });
 
-// Handle graceful shutdown
+// ✅ Handle port binding errors
+server.on('error', (error) => {
+    if (error.code === 'EADDRINUSE') {
+        console.error(`❌ Port ${PORT} is already in use. Trying alternative port...`);
+        const altPort = PORT + 1;
+        server.listen(altPort, '0.0.0.0', () => {
+            console.log(`✅ [SERVER] Now listening on port ${altPort}`);
+        });
+    } else {
+        console.error('❌ Server error:', error);
+        process.exit(1);
+    }
+});
+
 process.on('SIGTERM', () => {
-    console.log('📴 [SERVER] Received SIGTERM, shutting down gracefully...');
+    console.log('📴 Received SIGTERM, shutting down...');
     server.close(() => {
-        console.log('✅ [SERVER] Shutdown complete');
+        console.log('✅ Shutdown complete');
         process.exit(0);
     });
 });
 
-// Handle errors - log but don't exit
 process.on('uncaughtException', (error) => {
-    console.error('❌ [SERVER] Uncaught Exception:', error);
+    console.error('❌ Uncaught Exception:', error);
+    // Don't exit - keep server running
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('❌ [SERVER] Unhandled Rejection:', reason);
+    console.error('❌ Unhandled Rejection:', reason);
 });
 
 export default app;
