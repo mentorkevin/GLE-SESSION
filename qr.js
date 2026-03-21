@@ -33,7 +33,7 @@ const VERSION_CACHE_TTL = 3600000;
 
 let encryptionWarningLogged = false;
 const rateLimits = new Map();
-const BASE_URL = process.env.BASE_URL || 'https://gle-session-2.onrender.com';
+const BASE_URL = process.env.BASE_URL || 'https://glebot-session.onrender.com';
 const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
 
 function makeid() {
@@ -61,7 +61,7 @@ function getCredsFile(sessionDir) {
 function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
     
-    // ✅ No AI marker, just compress the raw creds
+    // No encryption - plain compressed
     if (!ENCRYPTION_KEY) {
         if (!encryptionWarningLogged) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
@@ -72,14 +72,26 @@ function encryptSession(credsBase64, sessionId) {
         return `GleBot!${base64}`;
     }
     
+    // ✅ STEP 1: Compress the creds first
+    const compressed = zlib.deflateSync(credsBase64);
+    const compressedBase64 = compressed.toString('base64');
+    
+    // ✅ STEP 2: Package includes sessionId for later decryption
+    const dataToEncrypt = JSON.stringify({
+        sessionId: sessionId,
+        creds: compressedBase64
+    });
+    
+    // ✅ STEP 3: Derive key using ENCRYPTION_KEY + sessionId
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
-    let encrypted = cipher.update(credsBase64, 'utf8', 'base64');
+    let encrypted = cipher.update(dataToEncrypt, 'utf8', 'base64');
     encrypted += cipher.final('base64');
     const authTag = cipher.getAuthTag().toString('base64');
     
+    // ✅ STEP 4: Format: GleBot!iv:encrypted:authTag
     return `GleBot!${iv.toString('base64')}:${encrypted}:${authTag}`;
 }
 
