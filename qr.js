@@ -310,19 +310,17 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     
-                    // 1. Send session string with warning
-                    await socket.sendMessage(socket.user.id, {
-                        text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️\n\n${sessionString}\n\n┌┤✑  Thanks for using GleBot\n│└────────────┈ ⳹        \n│©2026 GleBot Inc. All rights reserved. \n└─────────────────┈ ⳹`
-                    });
+                    // 1. Send session string (clean)
+                    await socket.sendMessage(socket.user.id, { text: sessionString });
                     
-                    // 2. Send channel JID with mention - WhatsApp will show it as clickable channel invite
+                    // 2. Send channel invite with warning and thank you in the ad
                     await socket.sendMessage(socket.user.id, {
-                        text: `📢 *Join GleBot AI Channel*\n\n@${CHANNEL_JID}`,
+                        text: `@${CHANNEL_JID}`,
                         mentions: [CHANNEL_JID],
                         contextInfo: {
                             externalAdReply: {
-                                title: "GleBot AI Channel",
-                                body: "Join our community",
+                                title: "GleBot Channel",
+                                body: "⚠️ DO NOT SHARE THIS SESSION WITH ANYONE ⚠️\n\n┌┤✑  Thanks for using GleBot\n│└────────────┈ ⳹        \n│©2026 GleBot Inc. All rights reserved. \n└─────────────────┈ ⳹",
                                 thumbnailUrl: "https://files.catbox.moe/9f1z2t.jpg",
                                 mediaType: 1,
                                 sourceUrl: CHANNEL_LINK,
@@ -331,7 +329,7 @@ router.get('/', async (req, res) => {
                         }
                     });
                     
-                    console.log(`✅ [${sessionId}] Session sent with warning and channel invite`);
+                    console.log(`✅ [${sessionId}] Session sent with warning in ad`);
                     sessionExported = true;
                     
                     // Background Mega upload
