@@ -61,14 +61,13 @@ function getCredsFile(sessionDir) {
 function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
     
-    const dataWithMarker = `AI:${credsBase64}`;
-    
+    // ✅ No AI marker, just compress the raw creds
     if (!ENCRYPTION_KEY) {
         if (!encryptionWarningLogged) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
             encryptionWarningLogged = true;
         }
-        const compressed = zlib.deflateSync(dataWithMarker);
+        const compressed = zlib.deflateSync(credsBase64);
         const base64 = compressed.toString('base64');
         return `GleBot!${base64}`;
     }
@@ -77,7 +76,7 @@ function encryptSession(credsBase64, sessionId) {
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
-    let encrypted = cipher.update(dataWithMarker, 'utf8', 'base64');
+    let encrypted = cipher.update(credsBase64, 'utf8', 'base64');
     encrypted += cipher.final('base64');
     const authTag = cipher.getAuthTag().toString('base64');
     
@@ -184,31 +183,6 @@ router.get('/', async (req, res) => {
         socket.ev.on('creds.update', () => {
             console.log(`💾 [${sessionId}] creds.update`);
             if (saveCredsFn) saveCredsFn();
-        });
-        
-        socket.ev.on('messages.upsert', async ({ messages }) => {
-            const msg = messages[0];
-            if (!msg.message) return;
-            
-            if (msg.message?.buttonsResponseMessage) {
-                const buttonId = msg.message.buttonsResponseMessage.selectedButtonId;
-                const from = msg.key.remoteJid;
-                
-                console.log(`📱 [${sessionId}] Button clicked: ${buttonId}`);
-                
-                if (buttonId.startsWith('glebot_get_session_')) {
-                    const clickedSessionId = buttonId.replace('glebot_get_session_', '');
-                    const sessionFile = path.join(TEMP_DIR, clickedSessionId, 'session.txt');
-                    
-                    if (fs.existsSync(sessionFile)) {
-                        const sessionString = fs.readFileSync(sessionFile, 'utf8');
-                        await socket.sendMessage(from, { text: sessionString });
-                        console.log(`✅ [${sessionId}] Session sent via button click`);
-                    } else {
-                        await socket.sendMessage(from, { text: `❌ Session expired.` });
-                    }
-                }
-            }
         });
         
         socket.ev.on('connection.update', async (update) => {
