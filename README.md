@@ -25,4 +25,4 @@
 | 🛡️ **Rate Limit Protection** | Smart delays to avoid WhatsApp rate limiting |
 | 🧹 **Clean Console Output** | Suppresses noisy Baileys internal logs |
 
-![GleSession stracture architecture](./glesession/2026.png)
+![GleSession stracture architecture](./glesession/202603.png)
