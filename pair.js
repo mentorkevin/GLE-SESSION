@@ -164,123 +164,104 @@ router.get('/', async (req, res) => {
         return res.status(429).json({ success: false, error: 'Rate limited. Please wait a minute.', sessionId });
     }
     
-    console.log(`\n🔷 [${sessionId}] Pairing session started for ${number}`);
-    
-    let currentSock = null;
+    if (!number) {
+        return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
+    }
+
+    number = number.replace(/\D/g, '');
+    const phone = pn('+' + number);
+    if (!phone.isValid()) {
+        return res.status(400).json({ success: false, error: 'Invalid number', sessionId });
+    }
+
+    const formattedNumber = phone.getNumber('e164').replace('+', '');
+    console.log(`\n🔷 [${sessionId}] Pairing session started for ${formattedNumber}`);
+
+    let sock = null;
     let codeSent = false;
     let sessionExported = false;
     let userConnected = false;
     let cleaned = false;
     let reconnectTimer = null;
-    let authState = null;
     let saveCredsFn = null;
-    let version = null;
-    let formattedNumber = null;
-    
+
     const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
         console.log(`🧹 [${sessionId}] Cleanup...`);
         if (reconnectTimer) clearTimeout(reconnectTimer);
-        if (currentSock) {
-            currentSock.ev.removeAllListeners();
-            try { currentSock.end(); } catch (e) {}
+        if (sock) {
+            sock.ev.removeAllListeners();
+            try { sock.end(); } catch (e) {}
         }
         setTimeout(() => removeFile(sessionDir), 5000);
     };
-    
-    // ✅ Create socket with proper event handlers using the current socket reference
-    const createSocket = () => {
-        const newSock = makeWASocket({
-            version,
-            auth: authState,
-            printQRInTerminal: false,
-            browser: Browsers.ubuntu("Chrome"),
-            syncFullHistory: false,
-            markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000,
-            defaultQueryTimeoutMs: 60000,
-            connectTimeoutMs: 60000
-        });
-        
-        newSock.ev.on('creds.update', () => {
+
+    const attachEvents = (socket) => {
+        socket.ev.on('creds.update', () => {
             console.log(`💾 [${sessionId}] creds.update`);
             if (saveCredsFn) saveCredsFn();
         });
-        
-        newSock.ev.on('connection.update', async (update) => {
+
+        socket.ev.on('connection.update', async (update) => {
             if (sessionExported || cleaned) return;
-            
+
             const { connection, lastDisconnect } = update;
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            
+
             console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
-            
-            // ✅ Handle 515 restart - MANUALLY RECREATE SOCKET
-            if (connection === 'close' && statusCode === 515 && codeSent && !sessionExported && !userConnected) {
-                console.log(`🔄 [${sessionId}] Restart detected (515) - recreating socket...`);
-                
+
+            // ⚠️ FIX: Catch the standard Error 515 (Handshake reset) so that pairing doesn't fail.
+            if (connection === 'close' && statusCode === 515 && !sessionExported && !userConnected) {
+                console.log(`🔄 [${sessionId}] Restart detected (515) - waiting for client auto-rebind...`);
                 if (reconnectTimer) clearTimeout(reconnectTimer);
-                
+
                 setTimeout(() => {
                     if (!userConnected && !sessionExported && !cleaned) {
-                        console.log(`🔁 [${sessionId}] Creating new socket after 515...`);
-                        
-                        // Close old socket
-                        if (currentSock) {
-                            currentSock.ev.removeAllListeners();
-                            try { currentSock.end(); } catch (e) {}
+                        if (sock) {
+                            sock.ev.removeAllListeners();
+                            try { sock.end(); } catch (e) {}
                         }
-                        
-                        // Create new socket and update reference
-                        currentSock = createSocket();
-                        console.log(`✅ [${sessionId}] New socket created, waiting for connection...`);
-                        
-                        reconnectTimer = setTimeout(() => {
-                            if (!userConnected && !sessionExported && !cleaned) {
-                                console.log(`⏰ [${sessionId}] User didn't enter code in time`);
-                                cleanup();
-                            }
-                        }, 120000);
+
+                        const newSock = makeWASocket({
+                            version: cachedVersion,
+                            auth: socket.authState,
+                            printQRInTerminal: false,
+                            browser: Browsers.ubuntu("Chrome"),
+                            syncFullHistory: false,
+                            markOnlineOnConnect: true,
+                        });
+
+                        sock = newSock;
+                        attachEvents(sock);
                     }
-                }, 2000);
+                }, 3000);
                 return;
             }
-            
-            // ✅ Login successful - use currentSock reference
-            if (connection === 'open' && currentSock?.user && !userConnected) {
+
+            if (connection === 'open' && socket?.user?.id && !userConnected) {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
-                console.log(`👤 User: ${currentSock.user.id}`);
-                
+
                 if (reconnectTimer) clearTimeout(reconnectTimer);
-                
+
                 console.log(`⏳ [${sessionId}] Waiting for files...`);
                 await delay(5000);
-                
+
                 try {
                     const credsBase64 = getCredsFile(sessionDir);
                     if (!credsBase64) throw new Error('creds.json not found');
-                    
+
                     const sessionString = encryptSession(credsBase64, sessionId);
                     const sessionFile = path.join(sessionDir, 'session.txt');
                     fs.writeFileSync(sessionFile, sessionString);
-                    
-                    console.log(`📤 [${sessionId}] Sending session...`);
-                    console.log(`📏 Session string length: ${sessionString.length} chars`);
-                    const userJid = formattedNumber + '@s.whatsapp.net';
-                    
-                    await currentSock.sendMessage(userJid, { text: sessionString });
-                    
-                    await currentSock.sendMessage(userJid, {
-                        text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
-┌┤✑  Thanks for using GleBot
-│└────────────┈ ⳹        
-│ ©2026 GleBot Inc. All rights reserved.
-└─────────────────┈ ⳹
+                    const userJid = socket.user.id;
 
-📢 Join our channel: ${CHANNEL_LINK}`,
+                    await socket.sendMessage(userJid, { text: sessionString });
+
+                    await socket.sendMessage(userJid, {
+                        text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️\n\n┌┤✑  Thanks for using GleBot\n│└────────────┈ ⳹\n│ ©2026 GleBot Inc. All rights reserved.\n└─────────────────┈ ⳹\n\n📢 Join our channel: ${CHANNEL_LINK}`,
                         contextInfo: {
                             externalAdReply: {
                                 title: "GleBot AI Channel",
@@ -292,124 +273,92 @@ router.get('/', async (req, res) => {
                             }
                         }
                     });
-                    
-                    console.log(`✅ [${sessionId}] Session sent`);
+
+                    console.log(`✅ [${sessionId}] Session sent to user.`);
                     sessionExported = true;
-                    
+
+                    // Mega Upload Stream
+                    (async () => {
+                        try {
+                            const megaUrl = await uploadSession(sessionString, sessionId);
+                            if (megaUrl && !megaUrl.startsWith('local://') && socket?.user) {
+                                await socket.sendMessage(userJid, {
+                                    text: `💾 *Mega Backup*\n\n${megaUrl}`
+                                });
+                            }
+                        } catch (e) {}
+                    })();
+
                     setTimeout(() => cleanup(), 30000);
-                    
+
                 } catch (err) {
                     console.error(`❌ [${sessionId}] Export failed:`, err);
                     cleanup();
                 }
             }
-            
-            // Cleanup on unexpected close
-            if (connection === 'close' && !sessionExported && !userConnected && !codeSent) {
-                console.log(`🔴 [${sessionId}] Connection closed before code sent`);
+
+            if (connection === 'close' && !sessionExported && !userConnected && statusCode !== 515) {
                 cleanup();
             }
         });
-        
-        return newSock;
     };
-    
+
     try {
-        if (!number) {
-            return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
-        }
-        
-        number = number.replace(/\D/g, '');
-        const phone = pn('+' + number);
-        if (!phone.isValid()) {
-            return res.status(400).json({ success: false, error: 'Invalid number', sessionId });
-        }
-        
-        formattedNumber = phone.getNumber('e164').replace('+', '');
         fs.mkdirSync(sessionDir, { recursive: true });
-        
+
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        authState = state;
         saveCredsFn = saveCreds;
-        version = await getCachedVersion();
-        
-        // Create initial socket
-        currentSock = createSocket();
-        
-        // Request code after socket is created
+
+        sock = makeWASocket({
+            version: await getCachedVersion(),
+            auth: state,
+            printQRInTerminal: false,
+            browser: Browsers.ubuntu("Chrome"),
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
+        });
+
+        attachEvents(sock);
+
+        // ⚠️ FIX: Pause for 4 seconds so Web Socket handshakes can happen. 
         setTimeout(async () => {
-            if (codeSent || sessionExported || cleaned) return;
-            
+            if (codeSent || cleaned || sessionExported) return;
+
             try {
-                console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
-                const code = await currentSock.requestPairingCode(formattedNumber);
+                const code = await sock.requestPairingCode(formattedNumber);
                 const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
-                
-                console.log(`✅ [${sessionId}] Code: ${formattedCode}`);
-                
                 codeSent = true;
-                
-                if (!res.headersSent && !cleaned) {
-                    res.json({
-                        success: true,
-                        code: formattedCode,
-                        sessionId,
-                        message: 'Enter this code in WhatsApp',
-                        instructions: [
-                            '1. Open WhatsApp on your phone',
-                            '2. Tap Menu > Linked Devices',
-                            '3. Tap "Link a Device"',
-                            `4. Enter this code: ${formattedCode}`,
-                            '',
-                            '⏱️ Code expires in 3 minutes'
-                        ]
-                    });
-                }
-                
-                setTimeout(() => {
-                    if (!userConnected && !sessionExported && !cleaned) {
-                        console.log(`⏰ [${sessionId}] Code timeout - cleaning up`);
-                        cleanup();
-                    }
-                }, 180000);
-                
+
+                res.json({
+                    success: true,
+                    code: formattedCode,
+                    sessionId,
+                    message: 'Link this code in WhatsApp linked devices'
+                });
+
             } catch (err) {
-                console.error(`Code error:`, err);
-                if (!res.headersSent && !cleaned) {
-                    res.status(500).json({ success: false, error: err.message, sessionId });
-                }
+                if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
                 cleanup();
             }
-        }, 3000);
-        
+        }, 4000);
+
         setTimeout(() => {
             if (!codeSent && !res.headersSent && !cleaned) {
-                res.status(504).json({ success: false, error: 'Code generation timeout', sessionId });
+                res.status(504).json({ success: false, error: 'Code generation timeout' });
                 cleanup();
             }
-        }, 30000);
-        
-        setTimeout(() => {
-            if (!sessionExported && !cleaned) {
-                console.log(`⏰ [${sessionId}] Timeout`);
-                cleanup();
-            }
-        }, 180000);
-        
+        }, 45000);
+
     } catch (error) {
-        console.error(`Fatal:`, error);
-        if (!res.headersSent && !cleaned) {
-            res.status(500).json({ success: false, error: error.message, sessionId });
-        }
+        if (!res.headersSent) res.status(500).json({ success: false, error: error.message });
         cleanup();
     }
 });
 
 router.get('/session/:sessionId', (req, res) => {
     const { sessionId } = req.params;
-    const sessionDir = path.join(TEMP_DIR, sessionId);
-    const sessionFile = path.join(sessionDir, 'session.txt');
-    
+    const sessionFile = path.join(TEMP_DIR, sessionId, 'session.txt');
+
     if (fs.existsSync(sessionFile)) {
         const sessionString = fs.readFileSync(sessionFile, 'utf8');
         res.json({ success: true, sessionString });
