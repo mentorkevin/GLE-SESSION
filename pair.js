@@ -82,8 +82,8 @@ function encryptSession(credsBase64, sessionId) {
         creds: compressedBase64
     });
     
-    // ✅ STEP 3: Derive key using ENCRYPTION_KEY + sessionId
-    const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
+    // ✅ STEP 3: Derive key using ENCRYPTION_KEY ONLY (NOT including sessionId)
+    const key = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
