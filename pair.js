@@ -1,6 +1,6 @@
 import express from 'express';
 import fs from 'fs';
-import { makeWASocket, useMultiFileAuthState, delay, Browsers, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, delay, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import pn from 'awesome-phonenumber';
 import { uploadSession } from './mega.js';
 import path from 'path';
@@ -47,13 +47,10 @@ function removeFile(filePath) {
 function getCredsFile(sessionDir) {
     try {
         const credsPath = path.join(sessionDir, 'creds.json');
-        if (!fs.existsSync(credsPath)) {
-            return null;
-        }
+        if (!fs.existsSync(credsPath)) return null;
         const content = fs.readFileSync(credsPath);
         return content.toString('base64');
     } catch (err) {
-        console.error(`Failed to read creds.json:`, err);
         return null;
     }
 }
@@ -127,31 +124,8 @@ setInterval(() => {
                 if (now - stat.mtimeMs > CLEANUP_AGE) removeFile(filePath);
             } catch (e) {}
         }
-        const sessions = fs.readdirSync(TEMP_DIR);
-        if (sessions.length > MAX_SESSIONS) {
-            sessions.sort((a, b) => {
-                try {
-                    const statA = fs.statSync(path.join(TEMP_DIR, a));
-                    const statB = fs.statSync(path.join(TEMP_DIR, b));
-                    return statA.mtimeMs - statB.mtimeMs;
-                } catch (e) { return 0; }
-            });
-            const toDelete = sessions.slice(0, sessions.length - MAX_SESSIONS);
-            for (const session of toDelete) removeFile(path.join(TEMP_DIR, session));
-        }
     } catch (e) {}
 }, 600000);
-
-setInterval(() => {
-    try {
-        const now = Date.now();
-        for (const [ip, times] of rateLimits.entries()) {
-            const recent = times.filter(t => now - t < 60000);
-            if (recent.length === 0) rateLimits.delete(ip);
-            else rateLimits.set(ip, recent);
-        }
-    } catch (e) {}
-}, 60000);
 
 // ==================== PAIRING ENDPOINT ====================
 router.get('/', async (req, res) => {
@@ -175,21 +149,18 @@ router.get('/', async (req, res) => {
     }
 
     const formattedNumber = phone.getNumber('e164').replace('+', '');
-    console.log(`\n🔷 [${sessionId}] Pairing session started for ${formattedNumber}`);
+    console.log(`\n🔷 [${sessionId}] Starting pairing for ${formattedNumber}`);
 
     let sock = null;
     let codeSent = false;
     let sessionExported = false;
     let userConnected = false;
     let cleaned = false;
-    let reconnectTimer = null;
-    let saveCredsFn = null;
 
     const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
         console.log(`🧹 [${sessionId}] Cleanup...`);
-        if (reconnectTimer) clearTimeout(reconnectTimer);
         if (sock) {
             sock.ev.removeAllListeners();
             try { sock.end(); } catch (e) {}
@@ -197,65 +168,50 @@ router.get('/', async (req, res) => {
         setTimeout(() => removeFile(sessionDir), 5000);
     };
 
-    const attachEvents = (socket) => {
-        socket.ev.on('creds.update', () => {
-            console.log(`💾 [${sessionId}] creds.update`);
-            if (saveCredsFn) saveCredsFn();
+    try {
+        fs.mkdirSync(sessionDir, { recursive: true });
+
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+        sock = makeWASocket({
+            version: await getCachedVersion(),
+            auth: state,
+            printQRInTerminal: false,
+            // ⚠️ FIX: WhatsApp blocks Ubuntu browser headers on code pairing! Use Chromium on Desktop.
+            browser: ["Chrome (Linux)", "Chrome", "120.0.0.0"],
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
+            logger: { level: 'silent' }
         });
 
-        socket.ev.on('connection.update', async (update) => {
+        sock.ev.on('creds.update', saveCreds);
+
+        sock.ev.on('connection.update', async (update) => {
             if (sessionExported || cleaned) return;
 
             const { connection, lastDisconnect } = update;
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            // Unwrapping boom error protocols safely
+            const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.status;
 
-            console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
+            console.log(`[${sessionId}] Connection state:`, connection || 'waiting');
 
-            // ⚠️ FIX: Catch the standard Error 515 (Handshake reset) so that pairing doesn't fail.
-            if (connection === 'close' && statusCode === 515 && !sessionExported && !userConnected) {
-                console.log(`🔄 [${sessionId}] Restart detected (515) - waiting for client auto-rebind...`);
-                if (reconnectTimer) clearTimeout(reconnectTimer);
-
-                setTimeout(() => {
-                    if (!userConnected && !sessionExported && !cleaned) {
-                        if (sock) {
-                            sock.ev.removeAllListeners();
-                            try { sock.end(); } catch (e) {}
-                        }
-
-                        const newSock = makeWASocket({
-                            version: cachedVersion,
-                            auth: socket.authState,
-                            printQRInTerminal: false,
-                            browser: Browsers.ubuntu("Chrome"),
-                            syncFullHistory: false,
-                            markOnlineOnConnect: true,
-                        });
-
-                        sock = newSock;
-                        attachEvents(sock);
-                    }
-                }, 3000);
+            // ⚠️ FIX: Ignore normal Web Handshake Disconnect on link
+            if (connection === 'close' && statusCode === 515) {
+                console.log(`🔄 [${sessionId}] Stream Handshake (515) successful. Re-establishing secure pipe...`);
                 return;
             }
 
             if (connection === 'open' && socket?.user?.id && !userConnected) {
                 userConnected = true;
-                console.log(`🎉 [${sessionId}] USER CONNECTED!`);
+                console.log(`🎉 [${sessionId}] LINK SUCCESSFUL!`);
 
-                if (reconnectTimer) clearTimeout(reconnectTimer);
-
-                console.log(`⏳ [${sessionId}] Waiting for files...`);
-                await delay(5000);
+                await delay(5000); // Give Baileys time to write data
 
                 try {
                     const credsBase64 = getCredsFile(sessionDir);
-                    if (!credsBase64) throw new Error('creds.json not found');
+                    if (!credsBase64) throw new Error('creds.json was failed to create on disk.');
 
                     const sessionString = encryptSession(credsBase64, sessionId);
-                    const sessionFile = path.join(sessionDir, 'session.txt');
-                    fs.writeFileSync(sessionFile, sessionString);
-
                     const userJid = socket.user.id;
 
                     await socket.sendMessage(userJid, { text: sessionString });
@@ -274,17 +230,14 @@ router.get('/', async (req, res) => {
                         }
                     });
 
-                    console.log(`✅ [${sessionId}] Session sent to user.`);
+                    console.log(`✅ [${sessionId}] Session successfully dumped to DM.`);
                     sessionExported = true;
 
-                    // Mega Upload Stream
                     (async () => {
                         try {
                             const megaUrl = await uploadSession(sessionString, sessionId);
-                            if (megaUrl && !megaUrl.startsWith('local://') && socket?.user) {
-                                await socket.sendMessage(userJid, {
-                                    text: `💾 *Mega Backup*\n\n${megaUrl}`
-                                });
+                            if (megaUrl && !megaUrl.startsWith('local://')) {
+                                await socket.sendMessage(userJid, { text: `💾 *Mega Backup*\n\n${megaUrl}` });
                             }
                         } catch (e) {}
                     })();
@@ -297,34 +250,17 @@ router.get('/', async (req, res) => {
                 }
             }
 
-            if (connection === 'close' && !sessionExported && !userConnected && statusCode !== 515) {
+            if (connection === 'close' && statusCode !== 515 && !userConnected) {
                 cleanup();
             }
         });
-    };
 
-    try {
-        fs.mkdirSync(sessionDir, { recursive: true });
-
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        saveCredsFn = saveCreds;
-
-        sock = makeWASocket({
-            version: await getCachedVersion(),
-            auth: state,
-            printQRInTerminal: false,
-            browser: Browsers.ubuntu("Chrome"),
-            syncFullHistory: false,
-            markOnlineOnConnect: true,
-        });
-
-        attachEvents(sock);
-
-        // ⚠️ FIX: Pause for 4 seconds so Web Socket handshakes can happen. 
+        // ⚠️ FIX: Request code ONLY when socket finishes TLS handshake (approx 5-6s)
         setTimeout(async () => {
             if (codeSent || cleaned || sessionExported) return;
 
             try {
+                console.log(`🔑 [${sessionId}] Requesting pairing code from WhatsApp...`);
                 const code = await sock.requestPairingCode(formattedNumber);
                 const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
                 codeSent = true;
@@ -337,17 +273,11 @@ router.get('/', async (req, res) => {
                 });
 
             } catch (err) {
+                console.error("Pairing failure trigger: ", err.message);
                 if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
                 cleanup();
             }
-        }, 4000);
-
-        setTimeout(() => {
-            if (!codeSent && !res.headersSent && !cleaned) {
-                res.status(504).json({ success: false, error: 'Code generation timeout' });
-                cleanup();
-            }
-        }, 45000);
+        }, 6000);
 
     } catch (error) {
         if (!res.headersSent) res.status(500).json({ success: false, error: error.message });
