@@ -1,7 +1,7 @@
 ## 🚀 Live Demo
 
 **🌐 Glesession is live on Render:**  
-👉 **[https://glebot-stage.onrender.com](https://glebot-session.onrender.com)** 👈
+👉 **[https://https://glebot-session.onrender.com](https://glebot-session.onrender.com)** 👈
 
 ## Automated WhatsApp Status Linker Using GleBot Sessions
 
