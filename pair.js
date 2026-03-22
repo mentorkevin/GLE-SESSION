@@ -71,11 +71,7 @@ function encryptSession(credsBase64, sessionId) {
     const compressed = zlib.deflateSync(credsBase64);
     const compressedBase64 = compressed.toString('base64');
     
-    const dataToEncrypt = JSON.stringify({
-        sessionId: sessionId,
-        creds: compressedBase64
-    });
-    
+    const dataToEncrypt = JSON.stringify({ sessionId, creds: compressedBase64 });
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -90,9 +86,7 @@ function encryptSession(credsBase64, sessionId) {
 async function getCachedVersion() {
     try {
         const now = Date.now();
-        if (cachedVersion && (now - versionCacheTime) < VERSION_CACHE_TTL) {
-            return cachedVersion;
-        }
+        if (cachedVersion && (now - versionCacheTime) < VERSION_CACHE_TTL) return cachedVersion;
         const { version } = await fetchLatestBaileysVersion();
         cachedVersion = version;
         versionCacheTime = now;
@@ -112,6 +106,7 @@ function checkRateLimit(ip) {
     return true;
 }
 
+// Cleanups 
 setInterval(() => {
     try {
         if (!fs.existsSync(TEMP_DIR)) return;
@@ -138,18 +133,14 @@ router.get('/', async (req, res) => {
         return res.status(429).json({ success: false, error: 'Rate limited. Please wait a minute.', sessionId });
     }
     
-    if (!number) {
-        return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
-    }
+    if (!number) return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
 
     number = number.replace(/\D/g, '');
     const phone = pn('+' + number);
-    if (!phone.isValid()) {
-        return res.status(400).json({ success: false, error: 'Invalid number', sessionId });
-    }
+    if (!phone.isValid()) return res.status(400).json({ success: false, error: 'Invalid number', sessionId });
 
     const formattedNumber = phone.getNumber('e164').replace('+', '');
-    console.log(`\n🔷 [${sessionId}] Starting pairing for ${formattedNumber}`);
+    console.log(`\n🔷 [${sessionId}] Starting pairing flow for ${formattedNumber}`);
 
     let sock = null;
     let codeSent = false;
@@ -177,8 +168,8 @@ router.get('/', async (req, res) => {
             version: await getCachedVersion(),
             auth: state,
             printQRInTerminal: false,
-            // ⚠️ FIX: WhatsApp blocks Ubuntu browser headers on code pairing! Use Chromium on Desktop.
-            browser: ["Chrome (Linux)", "Chrome", "120.0.0.0"],
+            // ⚠️ FIX: Real browser emulation stops WhatsApp from rejecting the code
+            browser: ["Windows", "Chrome", "114.0.5735.198"],
             syncFullHistory: false,
             markOnlineOnConnect: true,
             logger: { level: 'silent' }
@@ -190,14 +181,41 @@ router.get('/', async (req, res) => {
             if (sessionExported || cleaned) return;
 
             const { connection, lastDisconnect } = update;
-            // Unwrapping boom error protocols safely
-            const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.status;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
 
-            console.log(`[${sessionId}] Connection state:`, connection || 'waiting');
+            console.log(`[${sessionId}] Socket: ${connection || 'waiting'}`);
 
-            // ⚠️ FIX: Ignore normal Web Handshake Disconnect on link
+            // ⚠️ FIX: Fire the pairing request ONLY when the socket is fully connected and idling
+            if (connection === 'connecting' || update.qr || (connection === undefined && !codeSent)) {
+                if (!codeSent && !sock.authState.creds.registered) {
+                    codeSent = true; // Block double fires
+                    
+                    await delay(3000); // Give the TLS pipe 3 seconds to breathe
+                    console.log(`🔑 [${sessionId}] Reaching out to WhatsApp for Pair Code...`);
+
+                    try {
+                        const code = await sock.requestPairingCode(formattedNumber);
+                        const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
+
+                        if (!res.headersSent) {
+                            res.json({
+                                success: true,
+                                code: formattedCode,
+                                sessionId,
+                                message: 'Link this code in WhatsApp linked devices'
+                            });
+                        }
+                    } catch (err) {
+                        console.error(`❌ [${sessionId}] Code Request Error:`, err.message);
+                        if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
+                        cleanup();
+                    }
+                }
+            }
+
+            // Normal linkage handshakes
             if (connection === 'close' && statusCode === 515) {
-                console.log(`🔄 [${sessionId}] Stream Handshake (515) successful. Re-establishing secure pipe...`);
+                console.log(`🔄 [${sessionId}] Re-establishing pipe (515 handshake).`);
                 return;
             }
 
@@ -205,7 +223,7 @@ router.get('/', async (req, res) => {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] LINK SUCCESSFUL!`);
 
-                await delay(5000); // Give Baileys time to write data
+                await delay(5000);
 
                 try {
                     const credsBase64 = getCredsFile(sessionDir);
@@ -217,7 +235,7 @@ router.get('/', async (req, res) => {
                     await socket.sendMessage(userJid, { text: sessionString });
 
                     await socket.sendMessage(userJid, {
-                        text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️\n\n┌┤✑  Thanks for using GleBot\n│└────────────┈ ⳹\n│ ©2026 GleBot Inc. All rights reserved.\n└─────────────────┈ ⳹\n\n📢 Join our channel: ${CHANNEL_LINK}`,
+                        text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️\n\n©2026 GleBot Inc. All rights reserved.\n📢 Join: ${CHANNEL_LINK}`,
                         contextInfo: {
                             externalAdReply: {
                                 title: "GleBot AI Channel",
@@ -230,7 +248,7 @@ router.get('/', async (req, res) => {
                         }
                     });
 
-                    console.log(`✅ [${sessionId}] Session successfully dumped to DM.`);
+                    console.log(`✅ [${sessionId}] Sent session to DM.`);
                     sessionExported = true;
 
                     (async () => {
@@ -245,7 +263,6 @@ router.get('/', async (req, res) => {
                     setTimeout(() => cleanup(), 30000);
 
                 } catch (err) {
-                    console.error(`❌ [${sessionId}] Export failed:`, err);
                     cleanup();
                 }
             }
@@ -254,30 +271,6 @@ router.get('/', async (req, res) => {
                 cleanup();
             }
         });
-
-        // ⚠️ FIX: Request code ONLY when socket finishes TLS handshake (approx 5-6s)
-        setTimeout(async () => {
-            if (codeSent || cleaned || sessionExported) return;
-
-            try {
-                console.log(`🔑 [${sessionId}] Requesting pairing code from WhatsApp...`);
-                const code = await sock.requestPairingCode(formattedNumber);
-                const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
-                codeSent = true;
-
-                res.json({
-                    success: true,
-                    code: formattedCode,
-                    sessionId,
-                    message: 'Link this code in WhatsApp linked devices'
-                });
-
-            } catch (err) {
-                console.error("Pairing failure trigger: ", err.message);
-                if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
-                cleanup();
-            }
-        }, 6000);
 
     } catch (error) {
         if (!res.headersSent) res.status(500).json({ success: false, error: error.message });
