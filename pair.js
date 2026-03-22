@@ -177,38 +177,9 @@ router.get('/', async (req, res) => {
     let version = null;
     let formattedNumber = null;
     
-    const cleanup = () => {
-        if (cleaned) return;
-        cleaned = true;
-        console.log(`🧹 [${sessionId}] Cleanup...`);
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        if (sock) {
-            sock.ev.removeAllListeners();
-            try { sock.end(); } catch (e) {}
-        }
-        setTimeout(() => removeFile(sessionDir), 5000);
-    };
-    
-    try {
-        if (!number) {
-            return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
-        }
-        
-        number = number.replace(/\D/g, '');
-        const phone = pn('+' + number);
-        if (!phone.isValid()) {
-            return res.status(400).json({ success: false, error: 'Invalid number', sessionId });
-        }
-        
-        formattedNumber = phone.getNumber('e164').replace('+', '');
-        fs.mkdirSync(sessionDir, { recursive: true });
-        
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        authState = state;
-        saveCredsFn = saveCreds;
-        version = await getCachedVersion();
-        
-        sock = makeWASocket({
+    // Function to create socket with event handlers
+    const createSocket = () => {
+        const newSock = makeWASocket({
             version,
             auth: authState,
             printQRInTerminal: false,
@@ -220,13 +191,12 @@ router.get('/', async (req, res) => {
             connectTimeoutMs: 60000
         });
         
-        // Event handlers
-        sock.ev.on('creds.update', () => {
+        newSock.ev.on('creds.update', () => {
             console.log(`💾 [${sessionId}] creds.update`);
             if (saveCredsFn) saveCredsFn();
         });
         
-        sock.ev.on('connection.update', async (update) => {
+        newSock.ev.on('connection.update', async (update) => {
             if (sessionExported || cleaned) return;
             
             const { connection, lastDisconnect } = update;
@@ -234,68 +204,45 @@ router.get('/', async (req, res) => {
             
             console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
             
-            // ✅ Request code when connection is established
-            if (connection === 'connecting' && !codeSent && !sessionExported && !userConnected) {
-                codeSent = true;
-                try {
-                    console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
-                    const code = await sock.requestPairingCode(formattedNumber);
-                    const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
-                    
-                    console.log(`✅ [${sessionId}] Code: ${formattedCode}`);
-                    
-                    if (!res.headersSent && !cleaned) {
-                        res.json({
-                            success: true,
-                            code: formattedCode,
-                            sessionId,
-                            message: 'Enter this code in WhatsApp',
-                            instructions: [
-                                '1. Open WhatsApp on your phone',
-                                '2. Tap Menu > Linked Devices',
-                                '3. Tap "Link a Device"',
-                                `4. Enter this code: ${formattedCode}`,
-                                '',
-                                '⏱️ Code expires in 3 minutes'
-                            ]
-                        });
-                    }
-                    
-                    // Set timeout for code entry
-                    setTimeout(() => {
-                        if (!userConnected && !sessionExported && !cleaned) {
-                            console.log(`⏰ [${sessionId}] Code timeout - cleaning up`);
-                            cleanup();
-                        }
-                    }, 180000);
-                    
-                } catch (err) {
-                    console.error(`Code error:`, err);
-                    if (!res.headersSent && !cleaned) {
-                        res.status(500).json({ success: false, error: err.message, sessionId });
-                    }
-                    cleanup();
-                }
-            }
-            
-            // ✅ Handle 515 restart (expected after code generation)
-            if (connection === 'close' && statusCode === 515 && !sessionExported && !userConnected) {
-                console.log(`🔄 [${sessionId}] Restart after code - waiting for user to enter code...`);
+            // ✅ Handle 515 restart - MANUALLY RECREATE SOCKET
+            if (connection === 'close' && statusCode === 515 && codeSent && !sessionExported && !userConnected) {
+                console.log(`🔄 [${sessionId}] Restart detected (515) - recreating socket...`);
+                
+                // Clear existing reconnect timer
                 if (reconnectTimer) clearTimeout(reconnectTimer);
-                reconnectTimer = setTimeout(() => {
+                
+                // Recreate socket after 2 seconds
+                setTimeout(() => {
                     if (!userConnected && !sessionExported && !cleaned) {
-                        console.log(`⏰ [${sessionId}] User didn't enter code in time`);
-                        cleanup();
+                        console.log(`🔁 [${sessionId}] Creating new socket after 515...`);
+                        
+                        // Close old socket
+                        if (sock) {
+                            sock.ev.removeAllListeners();
+                            try { sock.end(); } catch (e) {}
+                        }
+                        
+                        // Create new socket
+                        sock = createSocket();
+                        console.log(`✅ [${sessionId}] New socket created, waiting for connection...`);
+                        
+                        // Set timeout for user to enter code
+                        reconnectTimer = setTimeout(() => {
+                            if (!userConnected && !sessionExported && !cleaned) {
+                                console.log(`⏰ [${sessionId}] User didn't enter code in time`);
+                                cleanup();
+                            }
+                        }, 120000);
                     }
-                }, 120000);
+                }, 2000);
                 return;
             }
             
             // ✅ Login successful (user entered code)
-            if (connection === 'open' && sock.user && !userConnected) {
+            if (connection === 'open' && newSock.user && !userConnected) {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
-                console.log(`👤 User: ${sock.user.id}`);
+                console.log(`👤 User: ${newSock.user.id}`);
                 
                 if (reconnectTimer) clearTimeout(reconnectTimer);
                 
@@ -314,9 +261,9 @@ router.get('/', async (req, res) => {
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     const userJid = formattedNumber + '@s.whatsapp.net';
                     
-                    await sock.sendMessage(userJid, { text: sessionString });
+                    await newSock.sendMessage(userJid, { text: sessionString });
                     
-                    await sock.sendMessage(userJid, {
+                    await newSock.sendMessage(userJid, {
                         text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
 ┌┤✑  Thanks for using GleBot
@@ -350,10 +297,94 @@ router.get('/', async (req, res) => {
             
             // Cleanup on unexpected close
             if (connection === 'close' && !sessionExported && !userConnected && !codeSent) {
-                console.log(`🔴 [${sessionId}] Connection closed without code sent`);
+                console.log(`🔴 [${sessionId}] Connection closed before code sent`);
                 cleanup();
             }
         });
+        
+        return newSock;
+    };
+    
+    const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        console.log(`🧹 [${sessionId}] Cleanup...`);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (sock) {
+            sock.ev.removeAllListeners();
+            try { sock.end(); } catch (e) {}
+        }
+        setTimeout(() => removeFile(sessionDir), 5000);
+    };
+    
+    try {
+        if (!number) {
+            return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
+        }
+        
+        number = number.replace(/\D/g, '');
+        const phone = pn('+' + number);
+        if (!phone.isValid()) {
+            return res.status(400).json({ success: false, error: 'Invalid number', sessionId });
+        }
+        
+        formattedNumber = phone.getNumber('e164').replace('+', '');
+        fs.mkdirSync(sessionDir, { recursive: true });
+        
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        authState = state;
+        saveCredsFn = saveCreds;
+        version = await getCachedVersion();
+        
+        // Create initial socket
+        sock = createSocket();
+        
+        // Request code after socket is created
+        setTimeout(async () => {
+            if (codeSent || sessionExported || cleaned) return;
+            
+            try {
+                console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
+                const code = await sock.requestPairingCode(formattedNumber);
+                const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
+                
+                console.log(`✅ [${sessionId}] Code: ${formattedCode}`);
+                
+                codeSent = true;
+                
+                if (!res.headersSent && !cleaned) {
+                    res.json({
+                        success: true,
+                        code: formattedCode,
+                        sessionId,
+                        message: 'Enter this code in WhatsApp',
+                        instructions: [
+                            '1. Open WhatsApp on your phone',
+                            '2. Tap Menu > Linked Devices',
+                            '3. Tap "Link a Device"',
+                            `4. Enter this code: ${formattedCode}`,
+                            '',
+                            '⏱️ Code expires in 3 minutes'
+                        ]
+                    });
+                }
+                
+                // Set timeout for code entry
+                setTimeout(() => {
+                    if (!userConnected && !sessionExported && !cleaned) {
+                        console.log(`⏰ [${sessionId}] Code timeout - cleaning up`);
+                        cleanup();
+                    }
+                }, 180000);
+                
+            } catch (err) {
+                console.error(`Code error:`, err);
+                if (!res.headersSent && !cleaned) {
+                    res.status(500).json({ success: false, error: err.message, sessionId });
+                }
+                cleanup();
+            }
+        }, 3000);
         
         // Timeout for code generation
         setTimeout(() => {
