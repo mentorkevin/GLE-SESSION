@@ -180,7 +180,7 @@ router.get('/', async (req, res) => {
     const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
-        console.log(`🧹 [${sessionId}] Cleanup...`);
+        console.log(`🧹 [${sessionId}] Starting cleanup...`);
         if (reconnectTimer) clearTimeout(reconnectTimer);
         if (sock) {
             sock.ev.removeAllListeners();
@@ -203,45 +203,31 @@ router.get('/', async (req, res) => {
             
             console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
             
-            if (connection === 'close' && statusCode === 515 && !sessionExported && !userConnected) {
-                console.log(`🔄 [${sessionId}] Restart detected - recreating socket...`);
-                
+            // ✅ Only cleanup on close if code wasn't sent yet
+            if (connection === 'close' && !codeSent && !sessionExported && !userConnected) {
+                console.log(`🔴 [${sessionId}] Connection closed before code sent`);
+                cleanup();
+                return;
+            }
+            
+            // ✅ Handle 515 restart - don't cleanup, wait for reconnect
+            if (connection === 'close' && statusCode === 515 && codeSent && !sessionExported && !userConnected) {
+                console.log(`🔄 [${sessionId}] Restart after code - waiting for user to enter code...`);
+                // Set timeout for user to enter code
                 if (reconnectTimer) clearTimeout(reconnectTimer);
-                
-                setTimeout(() => {
-                    if (!userConnected && !sessionExported && !cleaned) {
-                        console.log(`🔁 [${sessionId}] Creating new socket after 515...`);
-                        
-                        if (sock) {
-                            sock.ev.removeAllListeners();
-                            try { sock.end(); } catch (e) {}
-                        }
-                        
-                        const newSock = makeWASocket({
-                            version,
-                            auth: authState,
-                            printQRInTerminal: false,
-                            browser: Browsers.ubuntu("Chrome"),
-                            syncFullHistory: false,
-                            markOnlineOnConnect: true,
-                            keepAliveIntervalMs: 30000,
-                            defaultQueryTimeoutMs: 60000,
-                            connectTimeoutMs: 60000
-                        });
-                        
-                        sock = newSock;
-                        attachEvents(sock, numberToUse);
-                        console.log(`✅ [${sessionId}] New socket created, waiting for connection...`);
-                    }
-                }, 3000);
-                
                 reconnectTimer = setTimeout(() => {
-                    if (!userConnected && !sessionExported && !cleaned) {
-                        console.log(`⏰ [${sessionId}] Reconnect timeout`);
+                    if (!userConnected && !sessionExported) {
+                        console.log(`⏰ [${sessionId}] User didn't enter code in time`);
                         cleanup();
                     }
-                }, 60000);
+                }, 120000);
                 return;
+            }
+            
+            // ✅ Only cleanup on other closes if not connected
+            if (connection === 'close' && !sessionExported && !userConnected) {
+                console.log(`🔴 [${sessionId}] Connection closed without export`);
+                cleanup();
             }
             
             if (connection === 'open' && socket?.user?.id && !userConnected) {
@@ -306,17 +292,13 @@ router.get('/', async (req, res) => {
                         } catch (e) {}
                     })();
                     
+                    // ✅ Cleanup after successful export
                     setTimeout(() => cleanup(), 30000);
                     
                 } catch (err) {
                     console.error(`❌ [${sessionId}] Export failed:`, err);
                     cleanup();
                 }
-            }
-            
-            if (connection === 'close' && !sessionExported && !userConnected) {
-                console.log(`🔴 [${sessionId}] Connection closed without export`);
-                cleanup();
             }
         });
     };
@@ -354,29 +336,26 @@ router.get('/', async (req, res) => {
         
         attachEvents(sock, formattedNumber);
         
-        // ✅ FIX: Wait longer for socket to be ready before requesting code
+        // ✅ Request pairing code after a simple delay
         setTimeout(async () => {
             if (codeSent || sessionExported || cleaned) return;
             
             try {
                 console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
                 
-                // ✅ Wait for socket to be authenticated
-                let attempts = 0;
-                while (!sock.authState?.creds?.registered && attempts < 10) {
-                    await delay(1000);
-                    attempts++;
-                }
+                // Wait for socket to stabilize
+                await delay(3000);
                 
                 const code = await sock.requestPairingCode(formattedNumber);
                 
-                // ✅ Log the raw code to debug
-                console.log(`📝 Raw code from WhatsApp: ${code}`);
-                console.log(`📝 Code type: ${typeof code}, length: ${code.length}`);
+                // Log the raw code
+                console.log(`📝 Raw code from WhatsApp: "${code}"`);
+                console.log(`📝 Code length: ${code.length}`);
+                console.log(`📝 Code is numeric: ${/^\d+$/.test(code)}`);
                 
-                // ✅ Format code as 6-digit with hyphen (e.g., 123-456)
+                // Format code
                 let formattedCode;
-                if (code.length === 6) {
+                if (code && code.length === 6 && /^\d+$/.test(code)) {
                     formattedCode = `${code.slice(0, 3)}-${code.slice(3)}`;
                 } else {
                     formattedCode = code;
@@ -394,20 +373,18 @@ router.get('/', async (req, res) => {
                         message: 'Enter this code in WhatsApp',
                         instructions: [
                             '1. Open WhatsApp on your phone',
-                            '2. Go to Settings > Linked Devices',
-                            '3. Tap "Link a Device"',
-                            `4. Enter the code: ${formattedCode}`
+                            '2. Tap the 3 dots (Android) or Settings (iPhone)',
+                            '3. Go to "Linked Devices"',
+                            '4. Tap "Link a Device"',
+                            `5. Enter this code: ${formattedCode}`,
+                            '',
+                            '⚠️ DO NOT SCAN A QR CODE - Enter the code manually!',
+                            '',
+                            '⏱️ Code expires in 2 minutes'
                         ],
                         expiresIn: 120
                     });
                 }
-                
-                setTimeout(() => {
-                    if (!userConnected && !sessionExported) {
-                        console.log(`⏰ [${sessionId}] Code expired`);
-                        cleanup();
-                    }
-                }, 120000);
                 
             } catch (error) {
                 console.error(`❌ [${sessionId}] Code error:`, error);
@@ -416,14 +393,15 @@ router.get('/', async (req, res) => {
                 }
                 cleanup();
             }
-        }, 5000); // ✅ Increased delay to 5 seconds
+        }, 5000);
         
+        // Overall timeout
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Timeout`);
                 cleanup();
             }
-        }, 120000);
+        }, 180000);
         
     } catch (error) {
         console.error(`Fatal:`, error);
