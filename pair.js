@@ -166,7 +166,7 @@ router.get('/', async (req, res) => {
     
     console.log(`\n🔷 [${sessionId}] Pairing session started for ${number}`);
     
-    let sock = null;
+    let currentSock = null;
     let codeSent = false;
     let sessionExported = false;
     let userConnected = false;
@@ -177,7 +177,19 @@ router.get('/', async (req, res) => {
     let version = null;
     let formattedNumber = null;
     
-    // Function to create socket with event handlers
+    const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        console.log(`🧹 [${sessionId}] Cleanup...`);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (currentSock) {
+            currentSock.ev.removeAllListeners();
+            try { currentSock.end(); } catch (e) {}
+        }
+        setTimeout(() => removeFile(sessionDir), 5000);
+    };
+    
+    // ✅ Create socket with proper event handlers using the current socket reference
     const createSocket = () => {
         const newSock = makeWASocket({
             version,
@@ -208,25 +220,22 @@ router.get('/', async (req, res) => {
             if (connection === 'close' && statusCode === 515 && codeSent && !sessionExported && !userConnected) {
                 console.log(`🔄 [${sessionId}] Restart detected (515) - recreating socket...`);
                 
-                // Clear existing reconnect timer
                 if (reconnectTimer) clearTimeout(reconnectTimer);
                 
-                // Recreate socket after 2 seconds
                 setTimeout(() => {
                     if (!userConnected && !sessionExported && !cleaned) {
                         console.log(`🔁 [${sessionId}] Creating new socket after 515...`);
                         
                         // Close old socket
-                        if (sock) {
-                            sock.ev.removeAllListeners();
-                            try { sock.end(); } catch (e) {}
+                        if (currentSock) {
+                            currentSock.ev.removeAllListeners();
+                            try { currentSock.end(); } catch (e) {}
                         }
                         
-                        // Create new socket
-                        sock = createSocket();
+                        // Create new socket and update reference
+                        currentSock = createSocket();
                         console.log(`✅ [${sessionId}] New socket created, waiting for connection...`);
                         
-                        // Set timeout for user to enter code
                         reconnectTimer = setTimeout(() => {
                             if (!userConnected && !sessionExported && !cleaned) {
                                 console.log(`⏰ [${sessionId}] User didn't enter code in time`);
@@ -238,11 +247,11 @@ router.get('/', async (req, res) => {
                 return;
             }
             
-            // ✅ Login successful (user entered code)
-            if (connection === 'open' && newSock.user && !userConnected) {
+            // ✅ Login successful - use currentSock reference
+            if (connection === 'open' && currentSock?.user && !userConnected) {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
-                console.log(`👤 User: ${newSock.user.id}`);
+                console.log(`👤 User: ${currentSock.user.id}`);
                 
                 if (reconnectTimer) clearTimeout(reconnectTimer);
                 
@@ -261,9 +270,9 @@ router.get('/', async (req, res) => {
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     const userJid = formattedNumber + '@s.whatsapp.net';
                     
-                    await newSock.sendMessage(userJid, { text: sessionString });
+                    await currentSock.sendMessage(userJid, { text: sessionString });
                     
-                    await newSock.sendMessage(userJid, {
+                    await currentSock.sendMessage(userJid, {
                         text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
 ┌┤✑  Thanks for using GleBot
@@ -305,18 +314,6 @@ router.get('/', async (req, res) => {
         return newSock;
     };
     
-    const cleanup = () => {
-        if (cleaned) return;
-        cleaned = true;
-        console.log(`🧹 [${sessionId}] Cleanup...`);
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        if (sock) {
-            sock.ev.removeAllListeners();
-            try { sock.end(); } catch (e) {}
-        }
-        setTimeout(() => removeFile(sessionDir), 5000);
-    };
-    
     try {
         if (!number) {
             return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
@@ -337,7 +334,7 @@ router.get('/', async (req, res) => {
         version = await getCachedVersion();
         
         // Create initial socket
-        sock = createSocket();
+        currentSock = createSocket();
         
         // Request code after socket is created
         setTimeout(async () => {
@@ -345,7 +342,7 @@ router.get('/', async (req, res) => {
             
             try {
                 console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
-                const code = await sock.requestPairingCode(formattedNumber);
+                const code = await currentSock.requestPairingCode(formattedNumber);
                 const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
                 
                 console.log(`✅ [${sessionId}] Code: ${formattedCode}`);
@@ -369,7 +366,6 @@ router.get('/', async (req, res) => {
                     });
                 }
                 
-                // Set timeout for code entry
                 setTimeout(() => {
                     if (!userConnected && !sessionExported && !cleaned) {
                         console.log(`⏰ [${sessionId}] Code timeout - cleaning up`);
@@ -386,7 +382,6 @@ router.get('/', async (req, res) => {
             }
         }, 3000);
         
-        // Timeout for code generation
         setTimeout(() => {
             if (!codeSent && !res.headersSent && !cleaned) {
                 res.status(504).json({ success: false, error: 'Code generation timeout', sessionId });
@@ -394,7 +389,6 @@ router.get('/', async (req, res) => {
             }
         }, 30000);
         
-        // Overall timeout
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Timeout`);
