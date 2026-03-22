@@ -176,6 +176,7 @@ router.get('/', async (req, res) => {
     let saveCredsFn = null;
     let version = null;
     let formattedNumber = null;
+    let currentCode = null;
     
     const cleanup = () => {
         if (cleaned) return;
@@ -203,31 +204,84 @@ router.get('/', async (req, res) => {
             
             console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
             
-            // ✅ Only cleanup on close if code wasn't sent yet
-            if (connection === 'close' && !codeSent && !sessionExported && !userConnected) {
-                console.log(`🔴 [${sessionId}] Connection closed before code sent`);
-                cleanup();
-                return;
-            }
-            
-            // ✅ Handle 515 restart - don't cleanup, wait for reconnect
-            if (connection === 'close' && statusCode === 515 && codeSent && !sessionExported && !userConnected) {
-                console.log(`🔄 [${sessionId}] Restart after code - waiting for user to enter code...`);
-                // Set timeout for user to enter code
-                if (reconnectTimer) clearTimeout(reconnectTimer);
-                reconnectTimer = setTimeout(() => {
-                    if (!userConnected && !sessionExported) {
-                        console.log(`⏰ [${sessionId}] User didn't enter code in time`);
-                        cleanup();
-                    }
-                }, 120000);
-                return;
-            }
-            
-            // ✅ Only cleanup on other closes if not connected
-            if (connection === 'close' && !sessionExported && !userConnected) {
-                console.log(`🔴 [${sessionId}] Connection closed without export`);
-                cleanup();
+            // Handle close
+            if (connection === 'close') {
+                // If code was sent and we got 515, this is the restart
+                if (statusCode === 515 && codeSent && !sessionExported && !userConnected) {
+                    console.log(`🔄 [${sessionId}] Restart after code - re-requesting pairing code...`);
+                    
+                    // Clear existing timer
+                    if (reconnectTimer) clearTimeout(reconnectTimer);
+                    
+                    // Wait and request new code
+                    setTimeout(async () => {
+                        if (!userConnected && !sessionExported && !cleaned) {
+                            try {
+                                console.log(`🔑 [${sessionId}] Re-requesting pairing code after restart...`);
+                                const newCode = await socket.requestPairingCode(numberToUse);
+                                currentCode = newCode;
+                                
+                                const formattedCode = newCode.length === 6 && /^\d+$/.test(newCode) 
+                                    ? `${newCode.slice(0, 3)}-${newCode.slice(3)}` 
+                                    : newCode;
+                                
+                                console.log(`✅ [${sessionId}] New code: ${formattedCode}`);
+                                
+                                // Send updated code if response not sent yet
+                                if (!res.headersSent && !cleaned) {
+                                    res.json({
+                                        success: true,
+                                        code: formattedCode,
+                                        sessionId,
+                                        message: 'Enter this code in WhatsApp (new code after restart)',
+                                        instructions: [
+                                            '1. Open WhatsApp on your phone',
+                                            '2. Go to Settings > Linked Devices',
+                                            '3. Tap "Link a Device"',
+                                            `4. Enter this code: ${formattedCode}`,
+                                            '',
+                                            '⚠️ Enter the code manually!'
+                                        ],
+                                        expiresIn: 120
+                                    });
+                                }
+                                
+                                // Reset timeout
+                                reconnectTimer = setTimeout(() => {
+                                    if (!userConnected && !sessionExported) {
+                                        console.log(`⏰ [${sessionId}] User didn't enter code in time`);
+                                        cleanup();
+                                    }
+                                }, 120000);
+                                
+                            } catch (err) {
+                                console.error(`❌ [${sessionId}] Failed to re-request code:`, err);
+                                cleanup();
+                            }
+                        }
+                    }, 3000);
+                    return;
+                }
+                
+                // Only cleanup if code wasn't sent yet
+                if (!codeSent && !sessionExported && !userConnected) {
+                    console.log(`🔴 [${sessionId}] Connection closed before code sent`);
+                    cleanup();
+                    return;
+                }
+                
+                // If code was sent but no user connection after timeout, cleanup later
+                if (codeSent && !sessionExported && !userConnected) {
+                    console.log(`⏳ [${sessionId}] Waiting for user to enter code...`);
+                    if (reconnectTimer) clearTimeout(reconnectTimer);
+                    reconnectTimer = setTimeout(() => {
+                        if (!userConnected && !sessionExported) {
+                            console.log(`⏰ [${sessionId}] User didn't enter code in time`);
+                            cleanup();
+                        }
+                    }, 120000);
+                    return;
+                }
             }
             
             if (connection === 'open' && socket?.user?.id && !userConnected) {
@@ -292,7 +346,6 @@ router.get('/', async (req, res) => {
                         } catch (e) {}
                     })();
                     
-                    // ✅ Cleanup after successful export
                     setTimeout(() => cleanup(), 30000);
                     
                 } catch (err) {
@@ -336,24 +389,21 @@ router.get('/', async (req, res) => {
         
         attachEvents(sock, formattedNumber);
         
-        // ✅ Request pairing code after a simple delay
+        // Request initial pairing code
         setTimeout(async () => {
             if (codeSent || sessionExported || cleaned) return;
             
             try {
                 console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
-                
-                // Wait for socket to stabilize
                 await delay(3000);
                 
                 const code = await sock.requestPairingCode(formattedNumber);
+                currentCode = code;
                 
-                // Log the raw code
                 console.log(`📝 Raw code from WhatsApp: "${code}"`);
                 console.log(`📝 Code length: ${code.length}`);
                 console.log(`📝 Code is numeric: ${/^\d+$/.test(code)}`);
                 
-                // Format code
                 let formattedCode;
                 if (code && code.length === 6 && /^\d+$/.test(code)) {
                     formattedCode = `${code.slice(0, 3)}-${code.slice(3)}`;
@@ -395,7 +445,6 @@ router.get('/', async (req, res) => {
             }
         }, 5000);
         
-        // Overall timeout
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Timeout`);
