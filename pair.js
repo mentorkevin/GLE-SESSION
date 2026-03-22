@@ -61,7 +61,6 @@ function getCredsFile(sessionDir) {
 function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
     
-    // No encryption - plain compressed
     if (!ENCRYPTION_KEY) {
         if (!encryptionWarningLogged) {
             console.warn(`⚠️ Encryption disabled - plain text!`);
@@ -72,18 +71,15 @@ function encryptSession(credsBase64, sessionId) {
         return `GleBot!${base64}`;
     }
     
-    // ✅ STEP 1: Compress the creds first
     const compressed = zlib.deflateSync(credsBase64);
     const compressedBase64 = compressed.toString('base64');
     
-    // ✅ STEP 2: Package includes sessionId for later decryption
     const dataToEncrypt = JSON.stringify({
         sessionId: sessionId,
         creds: compressedBase64
     });
     
-    // ✅ STEP 3: Derive key using ENCRYPTION_KEY + sessionId
-    const key = crypto.createHash('sha256').update(ENCRYPTION_KEY + sessionId).digest();
+    const key = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     
@@ -91,7 +87,6 @@ function encryptSession(credsBase64, sessionId) {
     encrypted += cipher.final('base64');
     const authTag = cipher.getAuthTag().toString('base64');
     
-    // ✅ STEP 4: Format: GleBot!iv:encrypted:authTag
     return `GleBot!${iv.toString('base64')}:${encrypted}:${authTag}`;
 }
 
@@ -274,10 +269,8 @@ router.get('/', async (req, res) => {
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     const userJid = numberToUse + '@s.whatsapp.net';
                     
-                    // 1. Send session string (clean)
                     await socket.sendMessage(userJid, { text: sessionString });
                     
-                    // 2. Send warning, thank you, and channel link
                     await socket.sendMessage(userJid, {
                         text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
@@ -302,7 +295,6 @@ router.get('/', async (req, res) => {
                     console.log(`✅ [${sessionId}] Session sent with warning and channel link`);
                     sessionExported = true;
                     
-                    // Background Mega upload
                     (async () => {
                         try {
                             const megaUrl = await uploadSession(sessionString, sessionId);
@@ -362,13 +354,34 @@ router.get('/', async (req, res) => {
         
         attachEvents(sock, formattedNumber);
         
+        // ✅ FIX: Wait longer for socket to be ready before requesting code
         setTimeout(async () => {
             if (codeSent || sessionExported || cleaned) return;
             
             try {
-                console.log(`🔑 [${sessionId}] Requesting pairing code...`);
+                console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
+                
+                // ✅ Wait for socket to be authenticated
+                let attempts = 0;
+                while (!sock.authState?.creds?.registered && attempts < 10) {
+                    await delay(1000);
+                    attempts++;
+                }
+                
                 const code = await sock.requestPairingCode(formattedNumber);
-                const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
+                
+                // ✅ Log the raw code to debug
+                console.log(`📝 Raw code from WhatsApp: ${code}`);
+                console.log(`📝 Code type: ${typeof code}, length: ${code.length}`);
+                
+                // ✅ Format code as 6-digit with hyphen (e.g., 123-456)
+                let formattedCode;
+                if (code.length === 6) {
+                    formattedCode = `${code.slice(0, 3)}-${code.slice(3)}`;
+                } else {
+                    formattedCode = code;
+                }
+                
                 codeSent = true;
                 
                 console.log(`✅ [${sessionId}] Code: ${formattedCode}`);
@@ -389,6 +402,13 @@ router.get('/', async (req, res) => {
                     });
                 }
                 
+                setTimeout(() => {
+                    if (!userConnected && !sessionExported) {
+                        console.log(`⏰ [${sessionId}] Code expired`);
+                        cleanup();
+                    }
+                }, 120000);
+                
             } catch (error) {
                 console.error(`❌ [${sessionId}] Code error:`, error);
                 if (!res.headersSent && !cleaned) {
@@ -396,7 +416,7 @@ router.get('/', async (req, res) => {
                 }
                 cleanup();
             }
-        }, 3000);
+        }, 5000); // ✅ Increased delay to 5 seconds
         
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
