@@ -82,7 +82,7 @@ function encryptSession(credsBase64, sessionId) {
         creds: compressedBase64
     });
     
-    // ✅ STEP 3: Derive key using ENCRYPTION_KEY ONLY (NOT including sessionId)
+    // ✅ STEP 3: Derive key using ENCRYPTION_KEY ONLY
     const key = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -120,6 +120,7 @@ function checkRateLimit(ip) {
     return true;
 }
 
+// Cleanup intervals
 setInterval(() => {
     try {
         if (!fs.existsSync(TEMP_DIR)) return;
@@ -181,6 +182,7 @@ router.get('/', async (req, res) => {
     let saveCredsFn = null;
     let version = null;
     let formattedNumber = null;
+    let pairingCode = null;
     
     const cleanup = () => {
         if (cleaned) return;
@@ -274,10 +276,35 @@ router.get('/', async (req, res) => {
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     const userJid = numberToUse + '@s.whatsapp.net';
                     
-                    // 1. Send session string (clean)
-                    await socket.sendMessage(userJid, { text: sessionString });
+                    // Split session into chunks if too long (WhatsApp has message limit)
+                    const maxChunkSize = 65000;
+                    if (sessionString.length > maxChunkSize) {
+                        const chunks = [];
+                        for (let i = 0; i < sessionString.length; i += maxChunkSize) {
+                            chunks.push(sessionString.slice(i, i + maxChunkSize));
+                        }
+                        
+                        // Send first chunk with header
+                        await socket.sendMessage(userJid, { 
+                            text: `🔐 *GleBot Session* (Part 1/${chunks.length})\n\n${chunks[0]}` 
+                        });
+                        
+                        // Send remaining chunks
+                        for (let i = 1; i < chunks.length; i++) {
+                            await delay(2000);
+                            await socket.sendMessage(userJid, { 
+                                text: `📦 *Part ${i+1}/${chunks.length}*\n\n${chunks[i]}` 
+                            });
+                        }
+                        
+                        await socket.sendMessage(userJid, { 
+                            text: `✅ *Session Complete!*\n\nTotal: ${chunks.length} parts\nSave this session securely.` 
+                        });
+                    } else {
+                        await socket.sendMessage(userJid, { text: sessionString });
+                    }
                     
-                    // 2. Send warning, thank you, and channel link
+                    // Send warning and channel link
                     await socket.sendMessage(userJid, {
                         text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
@@ -334,13 +361,29 @@ router.get('/', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
         }
         
+        // Clean and format phone number
         number = number.replace(/\D/g, '');
-        const phone = pn('+' + number);
-        if (!phone.isValid()) {
-            return res.status(400).json({ success: false, error: 'Invalid number', sessionId });
+        
+        // Ensure number has country code (default to international format)
+        if (number.length === 10) {
+            // Assume US/CA numbers if 10 digits (add 1)
+            number = '1' + number;
         }
         
+        const phone = pn('+' + number);
+        if (!phone.isValid()) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid number. Please include country code (e.g., 1234567890 for US)', 
+                sessionId 
+            });
+        }
+        
+        // Get formatted number without + for pairing
         formattedNumber = phone.getNumber('e164').replace('+', '');
+        
+        console.log(`📱 [${sessionId}] Formatted number: ${formattedNumber}`);
+        
         fs.mkdirSync(sessionDir, { recursive: true });
         
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -362,51 +405,82 @@ router.get('/', async (req, res) => {
         
         attachEvents(sock, formattedNumber);
         
+        // Request pairing code after socket is ready
         setTimeout(async () => {
             if (codeSent || sessionExported || cleaned) return;
             
             try {
-                console.log(`🔑 [${sessionId}] Requesting pairing code...`);
+                console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
+                
+                // Wait for socket to be ready
+                await delay(2000);
+                
+                // Request pairing code
                 const code = await sock.requestPairingCode(formattedNumber);
-                const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
-                codeSent = true;
                 
-                console.log(`✅ [${sessionId}] Code: ${formattedCode}`);
-                
-                if (!res.headersSent && !cleaned) {
-                    res.json({
-                        success: true,
-                        code: formattedCode,
-                        sessionId,
-                        message: 'Enter this code in WhatsApp',
-                        instructions: [
-                            '1. Open WhatsApp on your phone',
-                            '2. Go to Settings > Linked Devices',
-                            '3. Tap "Link a Device"',
-                            `4. Enter the code: ${formattedCode}`
-                        ],
-                        expiresIn: 120
-                    });
+                if (code) {
+                    // Format code with hyphens for display (e.g., 123-456-789)
+                    const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
+                    pairingCode = code;
+                    codeSent = true;
+                    
+                    console.log(`✅ [${sessionId}] Pairing code: ${formattedCode}`);
+                    console.log(`📱 Tell user to enter: ${formattedCode} in WhatsApp > Settings > Linked Devices`);
+                    
+                    if (!res.headersSent && !cleaned) {
+                        res.json({
+                            success: true,
+                            code: formattedCode,
+                            rawCode: code,
+                            sessionId,
+                            message: 'Enter this code in WhatsApp',
+                            instructions: [
+                                '1. Open WhatsApp on your phone',
+                                '2. Go to Settings (3 dots)',
+                                '3. Tap "Linked Devices"',
+                                '4. Tap "Link a Device"',
+                                `5. Enter this code: ${formattedCode}`,
+                                '6. Wait for connection...'
+                            ],
+                            expiresIn: 120,
+                            note: 'Code expires in 2 minutes'
+                        });
+                    }
+                } else {
+                    throw new Error('No code received from WhatsApp');
                 }
                 
             } catch (error) {
-                console.error(`❌ [${sessionId}] Code error:`, error);
+                console.error(`❌ [${sessionId}] Code error:`, error.message);
                 if (!res.headersSent && !cleaned) {
-                    res.status(500).json({ success: false, error: error.message, sessionId });
+                    res.status(500).json({ 
+                        success: false, 
+                        error: `Failed to get pairing code: ${error.message}`,
+                        sessionId,
+                        help: 'Make sure the phone number is correct with country code'
+                    });
                 }
                 cleanup();
             }
-        }, 3000);
+        }, 5000); // Increased delay to ensure socket is ready
         
+        // Set timeout for entire process
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
-                console.log(`⏰ [${sessionId}] Timeout`);
+                console.log(`⏰ [${sessionId}] Session timeout - no connection established`);
+                if (!res.headersSent && !codeSent) {
+                    res.status(408).json({ 
+                        success: false, 
+                        error: 'Timeout waiting for connection',
+                        sessionId 
+                    });
+                }
                 cleanup();
             }
         }, 120000);
         
     } catch (error) {
-        console.error(`Fatal:`, error);
+        console.error(`❌ [${sessionId}] Fatal error:`, error);
         if (!res.headersSent && !cleaned) {
             res.status(500).json({ success: false, error: error.message, sessionId });
         }
@@ -423,8 +497,18 @@ router.get('/session/:sessionId', (req, res) => {
         const sessionString = fs.readFileSync(sessionFile, 'utf8');
         res.json({ success: true, sessionString });
     } else {
-        res.status(404).json({ success: false, error: 'Session not found' });
+        res.status(404).json({ success: false, error: 'Session not found or expired' });
     }
+});
+
+router.get('/status', (req, res) => {
+    const sessions = fs.existsSync(TEMP_DIR) ? fs.readdirSync(TEMP_DIR).length : 0;
+    res.json({
+        success: true,
+        activeSessions: sessions,
+        maxSessions: MAX_SESSIONS,
+        cleanupAge: CLEANUP_AGE / 1000 / 60 + ' minutes'
+    });
 });
 
 export default router;
