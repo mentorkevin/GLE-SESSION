@@ -29,7 +29,7 @@ const CLEANUP_AGE = 3600000;
 
 let cachedVersion = null;
 let versionCacheTime = 0;
-const VERSION_CACHE_TTL = 300000; // 5 minutes
+const VERSION_CACHE_TTL = 3600000;
 
 let encryptionWarningLogged = false;
 const rateLimits = new Map();
@@ -91,21 +91,17 @@ function encryptSession(credsBase64, sessionId) {
 }
 
 async function getCachedVersion() {
-    const now = Date.now();
-    if (cachedVersion && (now - versionCacheTime) < VERSION_CACHE_TTL) {
-        return cachedVersion;
-    }
     try {
-        console.log('📡 Fetching latest Baileys version...');
-        const { version, isLatest } = await fetchLatestBaileysVersion();
+        const now = Date.now();
+        if (cachedVersion && (now - versionCacheTime) < VERSION_CACHE_TTL) {
+            return cachedVersion;
+        }
+        const { version } = await fetchLatestBaileysVersion();
         cachedVersion = version;
         versionCacheTime = now;
-        console.log(`✅ Using Baileys version: ${version.join('.')} (isLatest: ${isLatest})`);
         return version;
     } catch (err) {
-        console.error('❌ Failed to fetch version:', err.message);
-        console.log('⚠️ Using fallback version: 2.3000.1035194821');
-        return [2, 3000, 1035194821];
+        return cachedVersion || [2, 3000, 1035194821];
     }
 }
 
@@ -184,7 +180,7 @@ router.get('/', async (req, res) => {
     const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
-        console.log(`🧹 [${sessionId}] Starting cleanup...`);
+        console.log(`🧹 [${sessionId}] Cleanup...`);
         if (reconnectTimer) clearTimeout(reconnectTimer);
         if (sock) {
             sock.ev.removeAllListeners();
@@ -207,28 +203,82 @@ router.get('/', async (req, res) => {
             
             console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
             
-            // ✅ Handle 515 restart - this is normal after code is generated
-            if (connection === 'close' && statusCode === 515 && codeSent && !sessionExported && !userConnected) {
-                console.log(`🔄 [${sessionId}] WhatsApp restart after code - waiting for user to enter code...`);
-                // Set timeout for user to enter code
+            // ✅ Handle QR code generation (for pairing, we generate code instead)
+            if (!codeSent && !res.headersSent && !cleaned) {
+                codeSent = true;
+                try {
+                    console.log(`🔑 [${sessionId}] Requesting pairing code...`);
+                    const code = await socket.requestPairingCode(numberToUse);
+                    
+                    const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
+                    console.log(`✅ [${sessionId}] Code: ${formattedCode}`);
+                    
+                    res.json({ 
+                        success: true, 
+                        code: formattedCode, 
+                        sessionId,
+                        message: 'Enter this code in WhatsApp',
+                        instructions: [
+                            '1. Open WhatsApp on your phone',
+                            '2. Tap Menu > Linked Devices',
+                            '3. Tap "Link a Device"',
+                            `4. Enter this code: ${formattedCode}`,
+                            '',
+                            '⏱️ Code expires in 3 minutes'
+                        ]
+                    });
+                } catch (err) {
+                    console.error(`Code error:`, err);
+                    if (!res.headersSent) {
+                        res.status(500).json({ success: false, error: 'Code generation failed', sessionId });
+                    }
+                    cleanup();
+                }
+            }
+            
+            // ✅ Handle restart after code is sent (same as QR)
+            if (connection === 'close' && statusCode === 515 && !sessionExported && !userConnected) {
+                console.log(`🔄 [${sessionId}] Restart detected - recreating socket...`);
+                
                 if (reconnectTimer) clearTimeout(reconnectTimer);
+                
+                setTimeout(() => {
+                    if (!userConnected && !sessionExported && !cleaned) {
+                        console.log(`🔁 [${sessionId}] Creating new socket after 515...`);
+                        
+                        if (sock) {
+                            sock.ev.removeAllListeners();
+                            try { sock.end(); } catch (e) {}
+                        }
+                        
+                        const newSock = makeWASocket({
+                            version,
+                            auth: authState,
+                            printQRInTerminal: false,
+                            browser: Browsers.ubuntu("Chrome"),
+                            syncFullHistory: false,
+                            markOnlineOnConnect: true,
+                            keepAliveIntervalMs: 30000,
+                            defaultQueryTimeoutMs: 60000,
+                            connectTimeoutMs: 60000
+                        });
+                        
+                        sock = newSock;
+                        attachEvents(sock, numberToUse);
+                        console.log(`✅ [${sessionId}] New socket created, waiting for connection...`);
+                    }
+                }, 3000);
+                
                 reconnectTimer = setTimeout(() => {
-                    if (!userConnected && !sessionExported) {
-                        console.log(`⏰ [${sessionId}] User didn't enter code in time`);
+                    if (!userConnected && !sessionExported && !cleaned) {
+                        console.log(`⏰ [${sessionId}] Reconnect timeout`);
                         cleanup();
                     }
-                }, 120000);
+                }, 60000);
                 return;
             }
             
-            // ✅ Only cleanup on other closes if code wasn't sent
-            if (connection === 'close' && !codeSent && !sessionExported && !userConnected) {
-                console.log(`🔴 [${sessionId}] Connection closed before code sent`);
-                cleanup();
-                return;
-            }
-            
-            // ✅ User connected! This is the final connection after entering code
+            // ✅ User connected after entering code
             if (connection === 'open' && socket?.user?.id && !userConnected) {
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
@@ -254,8 +304,10 @@ router.get('/', async (req, res) => {
                     console.log(`📏 Session string length: ${sessionString.length} chars`);
                     const userJid = numberToUse + '@s.whatsapp.net';
                     
+                    // 1. Send session string (clean)
                     await socket.sendMessage(userJid, { text: sessionString });
                     
+                    // 2. Send warning, thank you, and channel link
                     await socket.sendMessage(userJid, {
                         text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
@@ -280,6 +332,7 @@ router.get('/', async (req, res) => {
                     console.log(`✅ [${sessionId}] Session sent with warning and channel link`);
                     sessionExported = true;
                     
+                    // Background Mega upload
                     (async () => {
                         try {
                             const megaUrl = await uploadSession(sessionString, sessionId);
@@ -297,6 +350,11 @@ router.get('/', async (req, res) => {
                     console.error(`❌ [${sessionId}] Export failed:`, err);
                     cleanup();
                 }
+            }
+            
+            if (connection === 'close' && !sessionExported && !userConnected) {
+                console.log(`🔴 [${sessionId}] Connection closed without export`);
+                cleanup();
             }
         });
     };
@@ -334,54 +392,12 @@ router.get('/', async (req, res) => {
         
         attachEvents(sock, formattedNumber);
         
-        // ✅ Request pairing code after socket is ready
-        setTimeout(async () => {
-            if (codeSent || sessionExported || cleaned) return;
-            
-            try {
-                console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
-                
-                const code = await sock.requestPairingCode(formattedNumber);
-                
-                console.log(`📝 Raw code: "${code}"`);
-                
-                let formattedCode;
-                if (code && code.length === 6 && /^\d+$/.test(code)) {
-                    formattedCode = `${code.slice(0, 3)}-${code.slice(3)}`;
-                } else {
-                    formattedCode = code;
-                }
-                
-                codeSent = true;
-                
-                console.log(`✅ [${sessionId}] Code: ${formattedCode}`);
-                
-                if (!res.headersSent && !cleaned) {
-                    res.json({
-                        success: true,
-                        code: formattedCode,
-                        sessionId,
-                        message: 'Enter this code in WhatsApp',
-                        instructions: [
-                            '1. Open WhatsApp on your phone',
-                            '2. Go to Settings > Linked Devices',
-                            '3. Tap "Link a Device"',
-                            `4. Enter this code: ${formattedCode}`,
-                            '',
-                            '⚠️ Enter the code manually - DO NOT scan QR code!'
-                        ],
-                        expiresIn: 120
-                    });
-                }
-                
-            } catch (error) {
-                console.error(`❌ [${sessionId}] Code error:`, error);
-                if (!res.headersSent && !cleaned) {
-                    res.status(500).json({ success: false, error: error.message, sessionId });
-                }
+        setTimeout(() => {
+            if (!codeSent && !res.headersSent && !cleaned) {
+                res.status(504).json({ success: false, error: 'Code generation timeout', sessionId });
                 cleanup();
             }
-        }, 5000);
+        }, 30000);
         
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
