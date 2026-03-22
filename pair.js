@@ -166,27 +166,51 @@ router.get('/', async (req, res) => {
     
     console.log(`\n🔷 [${sessionId}] Pairing session started for ${number}`);
     
+    let sock = null;
+    let codeSent = false;
+    let sessionExported = false;
+    let userConnected = false;
+    let cleaned = false;
+    let reconnectTimer = null;
+    let authState = null;
+    let saveCredsFn = null;
+    let version = null;
+    let formattedNumber = null;
+    
+    const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        console.log(`🧹 [${sessionId}] Cleanup...`);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (sock) {
+            sock.ev.removeAllListeners();
+            try { sock.end(); } catch (e) {}
+        }
+        setTimeout(() => removeFile(sessionDir), 5000);
+    };
+    
     try {
-        if (!number) return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
+        if (!number) {
+            return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
+        }
         
         number = number.replace(/\D/g, '');
         const phone = pn('+' + number);
-        if (!phone.isValid()) return res.status(400).json({ success: false, error: 'Invalid number', sessionId });
+        if (!phone.isValid()) {
+            return res.status(400).json({ success: false, error: 'Invalid number', sessionId });
+        }
         
-        const formattedNumber = phone.getNumber('e164').replace('+', '');
+        formattedNumber = phone.getNumber('e164').replace('+', '');
         fs.mkdirSync(sessionDir, { recursive: true });
         
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        const { version } = await fetchLatestBaileysVersion();
+        authState = state;
+        saveCredsFn = saveCreds;
+        version = await getCachedVersion();
         
-        let codeSent = false;
-        let responseSent = false;
-        let loginCompleted = false;
-        let apiResponseSent = false;
-        
-        const sock = makeWASocket({
+        sock = makeWASocket({
             version,
-            auth: state,
+            auth: authState,
             printQRInTerminal: false,
             browser: Browsers.ubuntu("Chrome"),
             syncFullHistory: false,
@@ -196,18 +220,22 @@ router.get('/', async (req, res) => {
             connectTimeoutMs: 60000
         });
         
-        sock.ev.on('creds.update', saveCreds);
+        // Event handlers
+        sock.ev.on('creds.update', () => {
+            console.log(`💾 [${sessionId}] creds.update`);
+            if (saveCredsFn) saveCredsFn();
+        });
         
-        activeSessions.set(sessionId, { sock, sessionDir, number: formattedNumber, status: 'waiting' });
-        
-        // ✅ Same as QR: Wait for connection to be ready, then request code
         sock.ev.on('connection.update', async (update) => {
+            if (sessionExported || cleaned) return;
+            
             const { connection, lastDisconnect } = update;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
             
-            console.log(`[${sessionId}] State:`, connection || 'waiting');
+            console.log(`[${sessionId}] State:`, connection || 'waiting', statusCode ? `(code: ${statusCode})` : '');
             
-            // ✅ Request code when connection is ready (same as QR sends QR)
-            if (connection === 'connecting' && !codeSent && !responseSent) {
+            // ✅ Request code when connection is established
+            if (connection === 'connecting' && !codeSent && !sessionExported && !userConnected) {
                 codeSent = true;
                 try {
                     console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
@@ -216,57 +244,62 @@ router.get('/', async (req, res) => {
                     
                     console.log(`✅ [${sessionId}] Code: ${formattedCode}`);
                     
-                    res.json({
-                        success: true,
-                        code: formattedCode,
-                        sessionId,
-                        message: 'Enter this code in WhatsApp',
-                        instructions: [
-                            '1. Open WhatsApp on your phone',
-                            '2. Tap Menu > Linked Devices',
-                            '3. Tap "Link a Device"',
-                            `4. Enter the code: ${formattedCode}`,
-                            '',
-                            '⏱️ Code expires in 3 minutes'
-                        ]
-                    });
-                    responseSent = true;
+                    if (!res.headersSent && !cleaned) {
+                        res.json({
+                            success: true,
+                            code: formattedCode,
+                            sessionId,
+                            message: 'Enter this code in WhatsApp',
+                            instructions: [
+                                '1. Open WhatsApp on your phone',
+                                '2. Tap Menu > Linked Devices',
+                                '3. Tap "Link a Device"',
+                                `4. Enter this code: ${formattedCode}`,
+                                '',
+                                '⏱️ Code expires in 3 minutes'
+                            ]
+                        });
+                    }
                     
+                    // Set timeout for code entry
                     setTimeout(() => {
-                        if (!loginCompleted) {
+                        if (!userConnected && !sessionExported && !cleaned) {
                             console.log(`⏰ [${sessionId}] Code timeout - cleaning up`);
-                            sock.ws?.close();
-                            activeSessions.delete(sessionId);
-                            removeFile(sessionDir);
+                            cleanup();
                         }
                     }, 180000);
                     
                 } catch (err) {
                     console.error(`Code error:`, err);
-                    if (!responseSent) {
+                    if (!res.headersSent && !cleaned) {
                         res.status(500).json({ success: false, error: err.message, sessionId });
-                        responseSent = true;
                     }
                     cleanup();
                 }
             }
             
-            // ✅ Same as QR: Handle 515 restart
-            if (connection === 'close' && !loginCompleted) {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                if (statusCode === 515) {
-                    console.log(`🔄 [${sessionId}] Restart after code - waiting for reconnect...`);
-                    return;
-                }
+            // ✅ Handle 515 restart (expected after code generation)
+            if (connection === 'close' && statusCode === 515 && !sessionExported && !userConnected) {
+                console.log(`🔄 [${sessionId}] Restart after code - waiting for user to enter code...`);
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(() => {
+                    if (!userConnected && !sessionExported && !cleaned) {
+                        console.log(`⏰ [${sessionId}] User didn't enter code in time`);
+                        cleanup();
+                    }
+                }, 120000);
+                return;
             }
             
-            // ✅ Same as QR: Login detected
-            if (connection === 'open' && sock.user && !loginCompleted) {
-                console.log(`🎉 [${sessionId}] LOGIN SUCCESSFUL!`);
+            // ✅ Login successful (user entered code)
+            if (connection === 'open' && sock.user && !userConnected) {
+                userConnected = true;
+                console.log(`🎉 [${sessionId}] USER CONNECTED!`);
                 console.log(`👤 User: ${sock.user.id}`);
                 
-                loginCompleted = true;
+                if (reconnectTimer) clearTimeout(reconnectTimer);
                 
+                console.log(`⏳ [${sessionId}] Waiting for files...`);
                 await delay(5000);
                 
                 try {
@@ -314,22 +347,36 @@ router.get('/', async (req, res) => {
                     cleanup();
                 }
             }
+            
+            // Cleanup on unexpected close
+            if (connection === 'close' && !sessionExported && !userConnected && !codeSent) {
+                console.log(`🔴 [${sessionId}] Connection closed without code sent`);
+                cleanup();
+            }
         });
         
+        // Timeout for code generation
         setTimeout(() => {
-            if (!codeSent && !responseSent) {
+            if (!codeSent && !res.headersSent && !cleaned) {
                 res.status(504).json({ success: false, error: 'Code generation timeout', sessionId });
                 cleanup();
             }
         }, 30000);
         
+        // Overall timeout
+        setTimeout(() => {
+            if (!sessionExported && !cleaned) {
+                console.log(`⏰ [${sessionId}] Timeout`);
+                cleanup();
+            }
+        }, 180000);
+        
     } catch (error) {
         console.error(`Fatal:`, error);
-        if (!res.headersSent) {
+        if (!res.headersSent && !cleaned) {
             res.status(500).json({ success: false, error: error.message, sessionId });
         }
-        removeFile(sessionDir);
-        activeSessions.delete(sessionId);
+        cleanup();
     }
 });
 
