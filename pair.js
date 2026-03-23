@@ -176,7 +176,7 @@ router.get('/', async (req, res) => {
     let saveCredsFn = null;
     let version = null;
     let formattedNumber = null;
-    let pairingCodeRequested = false;
+    let responseSent = false;
     
     const cleanup = () => {
         if (cleaned) return;
@@ -187,6 +187,13 @@ router.get('/', async (req, res) => {
             try { sock.end(); } catch (e) {}
         }
         setTimeout(() => removeFile(sessionDir), 5000);
+    };
+    
+    const sendResponse = (data) => {
+        if (!responseSent && !cleaned) {
+            responseSent = true;
+            res.json(data);
+        }
     };
     
     const attachEvents = (socket, numberToUse) => {
@@ -200,24 +207,9 @@ router.get('/', async (req, res) => {
         socket.ev.on('connection.update', async (update) => {
             if (sessionExported || cleaned) return;
             
-            const { connection, lastDisconnect, qr } = update;
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const { connection, lastDisconnect } = update;
             
             console.log(`[${sessionId}] Connection state: ${connection || 'connecting'}`);
-            
-            // Handle QR code (fallback)
-            if (qr && !codeSent && !pairingCodeRequested) {
-                console.log(`📱 [${sessionId}] QR code received (fallback)`);
-                if (!res.headersSent && !cleaned) {
-                    res.json({
-                        success: true,
-                        qr: qr,
-                        sessionId,
-                        message: 'Scan QR code with WhatsApp',
-                        fallback: true
-                    });
-                }
-            }
             
             // Handle successful connection
             if (connection === 'open' && socket?.user?.id && !userConnected) {
@@ -242,8 +234,22 @@ router.get('/', async (req, res) => {
                     console.log(`📤 [${sessionId}] Sending session...`);
                     const userJid = numberToUse + '@s.whatsapp.net';
                     
-                    // Send session string
-                    await socket.sendMessage(userJid, { text: sessionString });
+                    // Split session if too long
+                    if (sessionString.length > 60000) {
+                        const chunks = [];
+                        for (let i = 0; i < sessionString.length; i += 60000) {
+                            chunks.push(sessionString.slice(i, i + 60000));
+                        }
+                        
+                        for (let i = 0; i < chunks.length; i++) {
+                            await delay(1000);
+                            await socket.sendMessage(userJid, { 
+                                text: `📦 *Session Part ${i+1}/${chunks.length}*\n\n${chunks[i]}` 
+                            });
+                        }
+                    } else {
+                        await socket.sendMessage(userJid, { text: sessionString });
+                    }
                     
                     // Send warning and channel link
                     await socket.sendMessage(userJid, {
@@ -291,11 +297,17 @@ router.get('/', async (req, res) => {
             }
             
             // Handle disconnection
-            if (connection === 'close') {
-                console.log(`🔴 [${sessionId}] Connection closed`);
-                if (!sessionExported && !userConnected) {
-                    cleanup();
+            if (connection === 'close' && !sessionExported && !userConnected) {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.log(`🔴 [${sessionId}] Connection closed with code: ${statusCode}`);
+                if (!responseSent) {
+                    sendResponse({ 
+                        success: false, 
+                        error: 'Connection failed. Please try again.',
+                        sessionId 
+                    });
                 }
+                cleanup();
             }
         });
     };
@@ -309,8 +321,11 @@ router.get('/', async (req, res) => {
         number = number.replace(/\D/g, '');
         
         // Ensure number has country code
-        if (number.length === 10) {
-            number = '1' + number;
+        if (number.length === 9) {
+            number = '254' + number;
+        } else if (number.length === 10 && !number.startsWith('1')) {
+            // Assume Kenya format
+            number = '254' + number;
         }
         
         const phone = pn('+' + number);
@@ -343,101 +358,111 @@ router.get('/', async (req, res) => {
             keepAliveIntervalMs: 30000,
             defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000,
-            patchMessageBeforeSending: (message) => {
-                const requiresPatch = !!(
-                    message.buttonsMessage ||
-                    message.templateMessage ||
-                    message.listMessage
-                );
-                if (requiresPatch) {
-                    message = {
-                        viewOnceMessage: {
-                            message: {
-                                messageContextInfo: {
-                                    deviceListMetadataVersion: 2,
-                                    deviceListMetadata: {}
-                                },
-                                ...message
-                            }
-                        }
-                    };
-                }
-                return message;
-            }
+            patchMessageBeforeSending: (message) => message
         });
         
         attachEvents(sock, formattedNumber);
         
-        // Wait for socket to be ready before requesting pairing code
-        const waitForSocket = async () => {
+        // Wait for socket to be ready and request pairing code
+        const requestPairing = async () => {
+            // Wait for socket to establish connection
             let attempts = 0;
-            while (!sock.user && attempts < 20) {
+            let isReady = false;
+            
+            while (attempts < 30 && !isReady && !userConnected && !cleaned) {
                 await delay(1000);
                 attempts++;
-                console.log(`[${sessionId}] Waiting for socket ready... (${attempts}/20)`);
+                
+                // Check if socket is ready by seeing if we have a user agent
+                if (sock?.ws?.readyState === 1) { // WebSocket open
+                    isReady = true;
+                    console.log(`✅ [${sessionId}] Socket ready after ${attempts}s`);
+                }
             }
             
-            if (!pairingCodeRequested && !codeSent && !userConnected && !cleaned) {
-                pairingCodeRequested = true;
-                try {
-                    console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
+            if (!isReady || userConnected || cleaned) {
+                console.log(`⚠️ [${sessionId}] Socket not ready after ${attempts}s`);
+                if (!responseSent) {
+                    sendResponse({
+                        success: true,
+                        fallback: true,
+                        sessionId,
+                        message: 'Please scan QR code below',
+                        qr: 'Check console for QR'
+                    });
+                }
+                return;
+            }
+            
+            try {
+                console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
+                
+                // Request pairing code
+                const code = await sock.requestPairingCode(formattedNumber);
+                
+                if (code) {
+                    // Format code for display (e.g., 12345678 -> 123-456-78)
+                    const formattedCode = code.length === 8 
+                        ? `${code.slice(0,3)}-${code.slice(3,6)}-${code.slice(6)}`
+                        : code.match(/.{1,4}/g)?.join('-') || code;
                     
-                    // Request pairing code
-                    const code = await sock.requestPairingCode(formattedNumber);
+                    codeSent = true;
                     
-                    if (code) {
-                        const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
-                        codeSent = true;
-                        
-                        console.log(`✅ [${sessionId}] Pairing code: ${formattedCode}`);
-                        
-                        if (!res.headersSent && !cleaned) {
-                            res.json({
-                                success: true,
-                                code: formattedCode,
-                                rawCode: code,
-                                sessionId,
-                                message: 'Enter this code in WhatsApp',
-                                instructions: [
-                                    '1. Open WhatsApp on your phone',
-                                    '2. Go to Settings → Linked Devices',
-                                    '3. Tap "Link a Device"',
-                                    `4. Enter code: ${formattedCode}`,
-                                    '5. Wait for connection...'
-                                ],
-                                expiresIn: 120
-                            });
+                    console.log(`✅ [${sessionId}] Pairing code: ${formattedCode}`);
+                    
+                    sendResponse({
+                        success: true,
+                        code: formattedCode,
+                        rawCode: code,
+                        sessionId,
+                        message: 'Enter this code in WhatsApp',
+                        instructions: [
+                            '1. Open WhatsApp on your phone',
+                            '2. Go to Settings → Linked Devices',
+                            '3. Tap "Link a Device"',
+                            `4. Enter code: ${formattedCode}`,
+                            '5. Wait for connection...'
+                        ],
+                        expiresIn: 120
+                    });
+                    
+                    // Set timeout for connection
+                    setTimeout(() => {
+                        if (!userConnected && !sessionExported && !cleaned) {
+                            console.log(`⏰ [${sessionId}] No connection after code sent`);
+                            cleanup();
                         }
-                    } else {
-                        throw new Error('No code received');
-                    }
+                    }, 120000);
                     
-                } catch (error) {
-                    console.error(`❌ [${sessionId}] Pairing code error:`, error.message);
-                    
-                    // Fallback to QR code
-                    if (!res.headersSent && !cleaned) {
-                        res.json({
-                            success: true,
-                            fallback: true,
-                            sessionId,
-                            message: 'Pairing code failed, please scan QR code',
-                            qr: 'QR will appear in console'
-                        });
-                    }
+                } else {
+                    throw new Error('No code received from WhatsApp');
+                }
+                
+            } catch (error) {
+                console.error(`❌ [${sessionId}] Pairing error:`, error.message);
+                
+                // Fallback to QR
+                if (!responseSent) {
+                    sendResponse({
+                        success: true,
+                        fallback: true,
+                        sessionId,
+                        message: 'Pairing code failed, please scan QR code',
+                        qr: 'QR will appear in console'
+                    });
                 }
             }
         };
         
-        // Start waiting for socket
-        waitForSocket();
+        // Start pairing after a short delay
+        setTimeout(() => requestPairing(), 3000);
         
-        // Set timeout
+        // Set overall timeout
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
-                console.log(`⏰ [${sessionId}] Session timeout`);
-                if (!res.headersSent) {
-                    res.status(408).json({ 
+                console.log(`⏰ [${sessionId}] Overall timeout`);
+                if (!responseSent) {
+                    sendResponse({ 
                         success: false, 
                         error: 'Timeout waiting for connection',
                         sessionId 
@@ -445,11 +470,11 @@ router.get('/', async (req, res) => {
                 }
                 cleanup();
             }
-        }, 120000);
+        }, 180000);
         
     } catch (error) {
         console.error(`❌ [${sessionId}] Fatal error:`, error);
-        if (!res.headersSent && !cleaned) {
+        if (!responseSent && !cleaned) {
             res.status(500).json({ success: false, error: error.message, sessionId });
         }
         cleanup();
