@@ -150,7 +150,6 @@ router.get('/', async (req, res) => {
     let { number } = req.query;
     const sessionDir = path.join(TEMP_DIR, sessionId);
     
-    // Properly parse x-forwarded-for header
     const clientIp = (req.headers['x-forwarded-for'] || req.ip || '')
         .toString()
         .split(',')[0]
@@ -206,11 +205,50 @@ router.get('/', async (req, res) => {
         }
     };
     
-    // Create pairing socket and request code
+    // Wait for device registration to complete
+    const waitForRegistration = (socket, timeoutMs = 30000) => {
+        return new Promise((resolve, reject) => {
+            let registrationCompleted = false;
+            
+            const timeout = setTimeout(() => {
+                if (!registrationCompleted) {
+                    socket.ev.off('connection.update', handler);
+                    reject(new Error('Timeout waiting for device registration'));
+                }
+            }, timeoutMs);
+            
+            const handler = (update) => {
+                const { connection, lastDisconnect } = update;
+                
+                // Log registration progress
+                if (update.connection) {
+                    console.log(`[${sessionId}] Connection state: ${update.connection}`);
+                }
+                
+                // Check for registration completion via device pairing data
+                if (update.devicePairingData || (update.connection === 'connecting' && update.user)) {
+                    registrationCompleted = true;
+                    clearTimeout(timeout);
+                    socket.ev.off('connection.update', handler);
+                    resolve();
+                }
+                
+                // Check for connection error
+                if (lastDisconnect?.error) {
+                    registrationCompleted = true;
+                    clearTimeout(timeout);
+                    socket.ev.off('connection.update', handler);
+                    reject(new Error(`Registration error: ${lastDisconnect.error.message}`));
+                }
+            };
+            
+            socket.ev.on('connection.update', handler);
+        });
+    };
+    
     const createPairing = async (attemptNum) => {
         console.log(`🔨 [${sessionId}] Creating socket (attempt ${attemptNum})...`);
         
-        // Clean session directory for fresh start
         if (fs.existsSync(sessionDir)) {
             removeFile(sessionDir);
         }
@@ -225,7 +263,7 @@ router.get('/', async (req, res) => {
         const sock = makeWASocket({
             version,
             auth: state,
-            browser: Browsers.macOS("Chrome"),
+            browser: Browsers.ubuntu("Chrome"), // Ubuntu browser has better trust
             printQRInTerminal: false,
             markOnlineOnConnect: false,
             connectTimeoutMs: 60000,
@@ -233,26 +271,15 @@ router.get('/', async (req, res) => {
             keepAliveIntervalMs: 30000
         });
         
-        // Handle credentials update
         sock.ev.on('creds.update', () => {
             console.log(`💾 [${sessionId}] creds.update`);
             if (saveCredsFn) saveCredsFn();
         });
         
-        // Log connection updates for debugging
-        sock.ev.on('connection.update', (update) => {
-            const { connection, lastDisconnect } = update;
-            if (connection) {
-                console.log(`[${sessionId}] Connection: ${connection}`);
-            }
-            if (lastDisconnect?.error) {
-                console.error(`[${sessionId}] Connection error:`, lastDisconnect.error.message);
-            }
-        });
-        
-        // Wait for WhatsApp handshake (3 seconds is enough)
-        console.log(`⏳ [${sessionId}] Waiting for WhatsApp handshake...`);
-        await delay(3000);
+        // Wait for device registration to complete
+        console.log(`⏳ [${sessionId}] Waiting for device registration...`);
+        await waitForRegistration(sock);
+        console.log(`✅ [${sessionId}] Device registration complete, ready for pairing`);
         
         console.log(`🔑 [${sessionId}] Requesting pairing code...`);
         const code = await sock.requestPairingCode(number);
@@ -276,7 +303,6 @@ router.get('/', async (req, res) => {
     };
     
     try {
-        // Pairing attempt with retry
         let pairingSuccess = false;
         
         for (let attempt = 1; attempt <= 3; attempt++) {
@@ -396,7 +422,6 @@ router.get('/', async (req, res) => {
                         console.log(`✅ [${sessionId}] Session sent successfully`);
                         sessionExported = true;
                         
-                        // Start Mega upload with tracking
                         megaUploadPromise = (async () => {
                             try {
                                 const megaUrl = await uploadSession(sessionString, sessionId);
@@ -422,7 +447,6 @@ router.get('/', async (req, res) => {
             }
         });
         
-        // Extended cleanup timer - 5 minutes for user to enter code
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Session timeout - no connection established`);
