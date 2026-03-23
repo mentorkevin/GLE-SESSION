@@ -90,7 +90,6 @@ async function getCachedVersion() {
         versionCacheTime = now;
         return version;
     } catch (err) {
-        // More stable fallback version
         return cachedVersion || [2, 2413, 1];
     }
 }
@@ -169,14 +168,13 @@ router.get('/', async (req, res) => {
         return res.status(429).json({ success: false, error: 'Rate limited. Please wait a minute.' });
     }
     
-    console.log(`\n🔷 [${sessionId}] Pairing session started for ${number} (IP: ${clientIp})`);
+    console.log(`\n🔷 [${sessionId}] Pairing session started for ${number}`);
     
     let currentSock = null;
     let sessionExported = false;
     let userConnected = false;
     let cleaned = false;
     let saveCredsFn = null;
-    let version = null;
     let responseSent = false;
     let megaUploadPromise = null;
     let megaUploadCompleted = false;
@@ -208,119 +206,58 @@ router.get('/', async (req, res) => {
         }
     };
     
-    const createSocket = async (attemptNum = 1) => {
+    // Create pairing socket and request code
+    const createPairing = async (attemptNum) => {
         console.log(`🔨 [${sessionId}] Creating socket (attempt ${attemptNum})...`);
         
+        // Clean session directory for fresh start
         if (fs.existsSync(sessionDir)) {
-            console.log(`🗑️ [${sessionId}] Removing old session directory`);
             removeFile(sessionDir);
         }
         fs.mkdirSync(sessionDir, { recursive: true });
         
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         saveCredsFn = saveCreds;
-        version = await getCachedVersion();
+        const version = await getCachedVersion();
         
-        const socket = makeWASocket({
+        console.log(`🔌 [${sessionId}] Initializing WhatsApp connection...`);
+        
+        const sock = makeWASocket({
             version,
             auth: state,
-            printQRInTerminal: false,
             browser: Browsers.macOS("Chrome"),
-            syncFullHistory: false,
-            markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000,
-            defaultQueryTimeoutMs: 20000,
-            connectTimeoutMs: 20000
+            printQRInTerminal: false,
+            markOnlineOnConnect: false,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 30000
         });
         
-        return socket;
-    };
-    
-    const waitForSocketReadiness = (socket, maxAttempts = 3) => {
-        return new Promise((resolve, reject) => {
-            let readinessTimeout = null;
-            let connectionState = null;
-            
-            const checkReadiness = () => {
-                const isReady = socket?.ws?.readyState === 1 && connectionState === 'connecting';
-                
-                if (isReady) {
-                    console.log(`✅ [${sessionId}] Socket fully ready (ws:${socket.ws.readyState}, conn:${connectionState})`);
-                    if (readinessTimeout) clearTimeout(readinessTimeout);
-                    socket.ev.off('connection.update', connectionHandler);
-                    resolve({ success: true, connectionState });
-                } else if (connectionState === 'close') {
-                    if (readinessTimeout) clearTimeout(readinessTimeout);
-                    socket.ev.off('connection.update', connectionHandler);
-                    reject(new Error(`Socket closed before ready (ws:${socket.ws?.readyState}, conn:${connectionState})`));
-                }
-            };
-            
-            const connectionHandler = (update) => {
-                const { connection, lastDisconnect } = update;
-                // Only update if connection has a value (prevent undefined overwriting)
-                if (connection) connectionState = connection;
-                
-                if (lastDisconnect?.error) {
-                    console.error(`❌ [${sessionId}] Connection error:`, lastDisconnect.error.message);
-                }
-                
-                console.log(`[${sessionId}] State: ws=${socket.ws?.readyState}, conn=${connectionState}`);
-                checkReadiness();
-            };
-            
-            socket.ev.on('connection.update', connectionHandler);
-            checkReadiness();
-            
-            readinessTimeout = setTimeout(() => {
-                socket.ev.off('connection.update', connectionHandler);
-                reject(new Error(`Timeout waiting for socket readiness (ws:${socket.ws?.readyState}, conn:${connectionState})`));
-            }, 30000);
+        // Handle credentials update
+        sock.ev.on('creds.update', () => {
+            console.log(`💾 [${sessionId}] creds.update`);
+            if (saveCredsFn) saveCredsFn();
         });
-    };
-    
-    const requestPairingWithFullRetry = async (phoneNumber, maxAttempts = 3) => {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            console.log(`🔑 [${sessionId}] Pairing attempt ${attempt}/${maxAttempts}...`);
-            
-            try {
-                const newSocket = await createSocket(attempt);
-                currentSock = newSocket;
-                
-                await waitForSocketReadiness(currentSock);
-                
-                if (currentSock.ws?.readyState !== 1) {
-                    throw new Error(`Socket not alive after readiness (ws:${currentSock.ws?.readyState})`);
-                }
-                
-                const code = await currentSock.requestPairingCode(phoneNumber);
-                
-                if (code) {
-                    const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
-                    console.log(`✅ [${sessionId}] Pairing code: ${formattedCode}`);
-                    return { success: true, code, formattedCode, socket: currentSock };
-                }
-                
-                throw new Error('No code received from WhatsApp');
-                
-            } catch (error) {
-                console.error(`❌ [${sessionId}] Pairing attempt ${attempt} failed:`, error.message);
-                
-                if (currentSock) {
-                    try { currentSock.end(); } catch (e) {}
-                    currentSock = null;
-                }
-                
-                if (attempt < maxAttempts) {
-                    console.log(`🔄 [${sessionId}] Retrying in 3 seconds...`);
-                    await delay(3000);
-                } else {
-                    return { success: false, error: error.message };
-                }
+        
+        // Log connection updates for debugging
+        sock.ev.on('connection.update', (update) => {
+            const { connection, lastDisconnect } = update;
+            if (connection) {
+                console.log(`[${sessionId}] Connection: ${connection}`);
             }
-        }
+            if (lastDisconnect?.error) {
+                console.error(`[${sessionId}] Connection error:`, lastDisconnect.error.message);
+            }
+        });
         
-        return { success: false, error: 'All pairing attempts failed' };
+        // Wait for WhatsApp handshake (3 seconds is enough)
+        console.log(`⏳ [${sessionId}] Waiting for WhatsApp handshake...`);
+        await delay(3000);
+        
+        console.log(`🔑 [${sessionId}] Requesting pairing code...`);
+        const code = await sock.requestPairingCode(number);
+        
+        return { sock, code };
     };
     
     const sendSessionWithRetry = async (socket, userJid, sessionString, retryCount = 0) => {
@@ -339,42 +276,63 @@ router.get('/', async (req, res) => {
     };
     
     try {
-        const pairingResult = await requestPairingWithFullRetry(number, 3);
+        // Pairing attempt with retry
+        let pairingSuccess = false;
         
-        if (!pairingResult.success) {
-            sendResponse({
-                success: false,
-                error: `Pairing failed: ${pairingResult.error}`,
-                sessionId
-            });
-            cleanup(5000);
-            return;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                console.log(`🔑 [${sessionId}] Pairing attempt ${attempt}/3`);
+                
+                const { sock, code } = await createPairing(attempt);
+                currentSock = sock;
+                
+                const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
+                console.log(`✅ [${sessionId}] Pairing code: ${formattedCode}`);
+                
+                sendResponse({
+                    success: true,
+                    code: formattedCode,
+                    rawCode: code,
+                    sessionId,
+                    phoneNumber: number,
+                    message: 'Enter this code in WhatsApp',
+                    instructions: [
+                        '1. Open WhatsApp on your phone',
+                        '2. Go to Settings → Linked Devices',
+                        '3. Tap "Link a Device"',
+                        `4. Enter this code: ${formattedCode}`,
+                        '5. Wait for connection...'
+                    ],
+                    expiresIn: 120
+                });
+                
+                pairingSuccess = true;
+                break;
+                
+            } catch (err) {
+                console.error(`❌ [${sessionId}] Attempt ${attempt} failed:`, err.message);
+                
+                if (currentSock) {
+                    try { currentSock.end(); } catch (e) {}
+                    currentSock = null;
+                }
+                
+                if (attempt < 3) {
+                    console.log(`🔄 [${sessionId}] Retrying in 3 seconds...`);
+                    await delay(3000);
+                } else {
+                    sendResponse({
+                        success: false,
+                        error: `Pairing failed after 3 attempts: ${err.message}`,
+                        sessionId
+                    });
+                    cleanup(5000);
+                    return;
+                }
+            }
         }
         
-        currentSock = pairingResult.socket;
-        
-        sendResponse({
-            success: true,
-            code: pairingResult.formattedCode,
-            rawCode: pairingResult.code,
-            sessionId,
-            phoneNumber: number,
-            message: 'Enter this code in WhatsApp',
-            instructions: [
-                '1. Open WhatsApp on your phone',
-                '2. Go to Settings → Linked Devices',
-                '3. Tap "Link a Device"',
-                `4. Enter this code: ${pairingResult.formattedCode}`,
-                '5. Wait for connection...'
-            ],
-            expiresIn: 120
-        });
-        
-        // Handle credentials update
-        currentSock.ev.on('creds.update', () => {
-            console.log(`💾 [${sessionId}] creds.update`);
-            if (saveCredsFn) saveCredsFn();
-        });
+        if (!pairingSuccess) return;
         
         // Handle connection updates for post-link tasks
         currentSock.ev.on('connection.update', async (update) => {
@@ -461,12 +419,6 @@ router.get('/', async (req, res) => {
                     console.error(`❌ [${sessionId}] Export failed:`, err);
                     cleanup(5000);
                 }
-            }
-            
-            if (connection === 'close' && !sessionExported && !userConnected) {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                console.log(`🔴 [${sessionId}] Connection closed before pairing, code: ${statusCode}`);
-                // Let the timeout handle cleanup - no automatic recreation here
             }
         });
         
