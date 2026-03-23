@@ -11,9 +11,14 @@ import zlib from 'zlib';
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Render.com port configuration
+const PORT = process.env.PORT || 3000;
+const BASE_URL = process.env.BASE_URL || `https://glebot-session.onrender.com`;
+const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
+
 router.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET');
+    res.header('Access-Control-Allow-Methods', 'GET, POST');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
     next();
 });
@@ -33,8 +38,6 @@ const VERSION_CACHE_TTL = 3600000;
 
 let encryptionWarningLogged = false;
 const rateLimits = new Map();
-const BASE_URL = process.env.BASE_URL || 'https://glebot-session.onrender.com';
-const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
 
 function makeid() {
     return crypto.randomBytes(8).toString('hex');
@@ -113,6 +116,60 @@ function checkRateLimit(ip) {
     recent.push(now);
     rateLimits.set(ip, recent);
     return true;
+}
+
+/**
+ * Format phone number globally
+ */
+function formatPhoneNumber(number) {
+    // Remove all non-digit characters
+    let cleaned = number.replace(/\D/g, '');
+    
+    // If number starts with 00, replace with +
+    if (cleaned.startsWith('00')) {
+        cleaned = cleaned.substring(2);
+    }
+    
+    // Auto-detect country code if number has no prefix
+    if (cleaned.length === 10 && !cleaned.startsWith('1')) {
+        // 10-digit number without country code - assume US/Canada
+        cleaned = '1' + cleaned;
+        console.log(`📱 Auto-detected US/Canada number: ${cleaned}`);
+    } else if (cleaned.length === 9 && cleaned.startsWith('7')) {
+        // 9-digit number starting with 7 - assume Kenya
+        cleaned = '254' + cleaned;
+        console.log(`📱 Auto-detected Kenya number: ${cleaned}`);
+    } else if (cleaned.length === 10 && cleaned.startsWith('7')) {
+        // 10-digit number starting with 7 - assume Kenya
+        cleaned = '254' + cleaned;
+        console.log(`📱 Auto-detected Kenya number: ${cleaned}`);
+    } else if (cleaned.length === 11 && cleaned.startsWith('0')) {
+        // 11-digit number starting with 0 - remove leading 0
+        cleaned = cleaned.substring(1);
+        console.log(`📱 Removed leading 0: ${cleaned}`);
+    }
+    
+    // Validate with awesome-phonenumber
+    const phone = pn('+' + cleaned);
+    
+    if (!phone.isValid()) {
+        // Try without the + if it failed
+        const phone2 = pn(cleaned);
+        if (phone2.isValid()) {
+            return phone2.getNumber('e164').replace('+', '');
+        }
+        throw new Error(`Invalid phone number: ${number}. Please include country code (e.g., 1234567890 for US, 447911123456 for UK, 254712345678 for Kenya)`);
+    }
+    
+    // Return formatted number without +
+    const formatted = phone.getNumber('e164').replace('+', '');
+    const countryCode = phone.getCountryCode();
+    const regionCode = phone.getRegionCode();
+    
+    console.log(`📱 Validated number: +${formatted}`);
+    console.log(`   Country: ${regionCode} (${countryCode})`);
+    
+    return formatted;
 }
 
 // Cleanup intervals
@@ -317,28 +374,8 @@ router.get('/', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
         }
         
-        // Clean and format phone number
-        number = number.replace(/\D/g, '');
-        
-        // Ensure number has country code
-        if (number.length === 9) {
-            number = '254' + number;
-        } else if (number.length === 10 && !number.startsWith('1')) {
-            // Assume Kenya format
-            number = '254' + number;
-        }
-        
-        const phone = pn('+' + number);
-        if (!phone.isValid()) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Invalid number. Please include country code', 
-                sessionId 
-            });
-        }
-        
-        formattedNumber = phone.getNumber('e164').replace('+', '');
-        console.log(`📱 [${sessionId}] Formatted number: ${formattedNumber}`);
+        // Format phone number globally
+        formattedNumber = formatPhoneNumber(number);
         
         fs.mkdirSync(sessionDir, { recursive: true });
         
@@ -373,8 +410,8 @@ router.get('/', async (req, res) => {
                 await delay(1000);
                 attempts++;
                 
-                // Check if socket is ready by seeing if we have a user agent
-                if (sock?.ws?.readyState === 1) { // WebSocket open
+                // Check if socket is ready
+                if (sock?.ws?.readyState === 1) {
                     isReady = true;
                     console.log(`✅ [${sessionId}] Socket ready after ${attempts}s`);
                 }
@@ -388,7 +425,7 @@ router.get('/', async (req, res) => {
                         fallback: true,
                         sessionId,
                         message: 'Please scan QR code below',
-                        qr: 'Check console for QR'
+                        qr: 'QR will appear in console'
                     });
                 }
                 return;
@@ -401,10 +438,15 @@ router.get('/', async (req, res) => {
                 const code = await sock.requestPairingCode(formattedNumber);
                 
                 if (code) {
-                    // Format code for display (e.g., 12345678 -> 123-456-78)
-                    const formattedCode = code.length === 8 
-                        ? `${code.slice(0,3)}-${code.slice(3,6)}-${code.slice(6)}`
-                        : code.match(/.{1,4}/g)?.join('-') || code;
+                    // Format code for display
+                    let formattedCode;
+                    if (code.length === 8) {
+                        formattedCode = `${code.slice(0,3)}-${code.slice(3,6)}-${code.slice(6)}`;
+                    } else if (code.length === 10) {
+                        formattedCode = `${code.slice(0,4)}-${code.slice(4,8)}-${code.slice(8)}`;
+                    } else {
+                        formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
+                    }
                     
                     codeSent = true;
                     
@@ -415,12 +457,14 @@ router.get('/', async (req, res) => {
                         code: formattedCode,
                         rawCode: code,
                         sessionId,
+                        phoneNumber: `+${formattedNumber}`,
+                        baseUrl: BASE_URL,
                         message: 'Enter this code in WhatsApp',
                         instructions: [
                             '1. Open WhatsApp on your phone',
                             '2. Go to Settings → Linked Devices',
                             '3. Tap "Link a Device"',
-                            `4. Enter code: ${formattedCode}`,
+                            `4. Enter this code: ${formattedCode}`,
                             '5. Wait for connection...'
                         ],
                         expiresIn: 120
@@ -475,7 +519,7 @@ router.get('/', async (req, res) => {
     } catch (error) {
         console.error(`❌ [${sessionId}] Fatal error:`, error);
         if (!responseSent && !cleaned) {
-            res.status(500).json({ success: false, error: error.message, sessionId });
+            res.status(400).json({ success: false, error: error.message, sessionId });
         }
         cleanup();
     }
@@ -499,7 +543,9 @@ router.get('/status', (req, res) => {
     res.json({
         success: true,
         activeSessions: sessions,
-        maxSessions: MAX_SESSIONS
+        maxSessions: MAX_SESSIONS,
+        baseUrl: BASE_URL,
+        port: PORT
     });
 });
 
