@@ -1,7 +1,6 @@
 import express from 'express';
 import fs from 'fs';
 import { makeWASocket, useMultiFileAuthState, delay, Browsers, fetchLatestBaileysVersion, DisconnectReason } from '@whiskeysockets/baileys';
-import pn from 'awesome-phonenumber';
 import { uploadSession } from './mega.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -11,14 +10,13 @@ import zlib from 'zlib';
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Render.com port configuration
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `https://glebot-session.onrender.com`;
 const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
 
 router.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST');
+    res.header('Access-Control-Allow-Methods', 'GET');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
     next();
 });
@@ -31,13 +29,11 @@ if (!fs.existsSync(TEMP_DIR)) {
 
 const MAX_SESSIONS = 100;
 const CLEANUP_AGE = 3600000;
+const RATE_LIMIT_MAP = new Map();
 
 let cachedVersion = null;
 let versionCacheTime = 0;
 const VERSION_CACHE_TTL = 3600000;
-
-let encryptionWarningLogged = false;
-const rateLimits = new Map();
 
 function makeid() {
     return crypto.randomBytes(8).toString('hex');
@@ -50,9 +46,7 @@ function removeFile(filePath) {
 function getCredsFile(sessionDir) {
     try {
         const credsPath = path.join(sessionDir, 'creds.json');
-        if (!fs.existsSync(credsPath)) {
-            return null;
-        }
+        if (!fs.existsSync(credsPath)) return null;
         const content = fs.readFileSync(credsPath);
         return content.toString('base64');
     } catch (err) {
@@ -65,10 +59,7 @@ function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
     
     if (!ENCRYPTION_KEY) {
-        if (!encryptionWarningLogged) {
-            console.warn(`⚠️ Encryption disabled - plain text!`);
-            encryptionWarningLogged = true;
-        }
+        console.warn(`⚠️ Encryption disabled - plain text!`);
         const compressed = zlib.deflateSync(credsBase64);
         const base64 = compressed.toString('base64');
         return `GleBot!${base64}`;
@@ -110,66 +101,12 @@ async function getCachedVersion() {
 
 function checkRateLimit(ip) {
     const now = Date.now();
-    const limit = rateLimits.get(ip) || [];
+    const limit = RATE_LIMIT_MAP.get(ip) || [];
     const recent = limit.filter(t => now - t < 60000);
     if (recent.length >= 3) return false;
     recent.push(now);
-    rateLimits.set(ip, recent);
+    RATE_LIMIT_MAP.set(ip, recent);
     return true;
-}
-
-/**
- * Format phone number globally
- */
-function formatPhoneNumber(number) {
-    // Remove all non-digit characters
-    let cleaned = number.replace(/\D/g, '');
-    
-    // If number starts with 00, replace with +
-    if (cleaned.startsWith('00')) {
-        cleaned = cleaned.substring(2);
-    }
-    
-    // Auto-detect country code if number has no prefix
-    if (cleaned.length === 10 && !cleaned.startsWith('1')) {
-        // 10-digit number without country code - assume US/Canada
-        cleaned = '1' + cleaned;
-        console.log(`📱 Auto-detected US/Canada number: ${cleaned}`);
-    } else if (cleaned.length === 9 && cleaned.startsWith('7')) {
-        // 9-digit number starting with 7 - assume Kenya
-        cleaned = '254' + cleaned;
-        console.log(`📱 Auto-detected Kenya number: ${cleaned}`);
-    } else if (cleaned.length === 10 && cleaned.startsWith('7')) {
-        // 10-digit number starting with 7 - assume Kenya
-        cleaned = '254' + cleaned;
-        console.log(`📱 Auto-detected Kenya number: ${cleaned}`);
-    } else if (cleaned.length === 11 && cleaned.startsWith('0')) {
-        // 11-digit number starting with 0 - remove leading 0
-        cleaned = cleaned.substring(1);
-        console.log(`📱 Removed leading 0: ${cleaned}`);
-    }
-    
-    // Validate with awesome-phonenumber
-    const phone = pn('+' + cleaned);
-    
-    if (!phone.isValid()) {
-        // Try without the + if it failed
-        const phone2 = pn(cleaned);
-        if (phone2.isValid()) {
-            return phone2.getNumber('e164').replace('+', '');
-        }
-        throw new Error(`Invalid phone number: ${number}. Please include country code (e.g., 1234567890 for US, 447911123456 for UK, 254712345678 for Kenya)`);
-    }
-    
-    // Return formatted number without +
-    const formatted = phone.getNumber('e164').replace('+', '');
-    const countryCode = phone.getCountryCode();
-    const regionCode = phone.getRegionCode();
-    
-    console.log(`📱 Validated number: +${formatted}`);
-    console.log(`   Country: ${regionCode} (${countryCode})`);
-    
-    return formatted;
 }
 
 // Cleanup intervals
@@ -203,10 +140,10 @@ setInterval(() => {
 setInterval(() => {
     try {
         const now = Date.now();
-        for (const [ip, times] of rateLimits.entries()) {
+        for (const [ip, times] of RATE_LIMIT_MAP.entries()) {
             const recent = times.filter(t => now - t < 60000);
-            if (recent.length === 0) rateLimits.delete(ip);
-            else rateLimits.set(ip, recent);
+            if (recent.length === 0) RATE_LIMIT_MAP.delete(ip);
+            else RATE_LIMIT_MAP.set(ip, recent);
         }
     } catch (e) {}
 }, 60000);
@@ -219,21 +156,30 @@ router.get('/', async (req, res) => {
     
     const clientIp = req.headers['x-forwarded-for'] || req.ip;
     if (!checkRateLimit(clientIp)) {
-        return res.status(429).json({ success: false, error: 'Rate limited. Please wait a minute.', sessionId });
+        return res.status(429).json({ success: false, error: 'Rate limited. Please wait a minute.' });
+    }
+    
+    // Validate number - pure digits only, 10-15 digits
+    if (!number || !/^\d{10,15}$/.test(number)) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Invalid phone number. Must be 10-15 digits only (no spaces, no +, no dashes).',
+            example: '1234567890'
+        });
     }
     
     console.log(`\n🔷 [${sessionId}] Pairing session started for ${number}`);
     
     let sock = null;
-    let codeSent = false;
     let sessionExported = false;
     let userConnected = false;
     let cleaned = false;
     let authState = null;
     let saveCredsFn = null;
     let version = null;
-    let formattedNumber = null;
     let responseSent = false;
+    let pairingRequested = false;
+    let connectionEstablished = false;
     
     const cleanup = () => {
         if (cleaned) return;
@@ -253,35 +199,63 @@ router.get('/', async (req, res) => {
         }
     };
     
-    const attachEvents = (socket, numberToUse) => {
+    try {
+        // Delete any old session to ensure fresh pairing
+        if (fs.existsSync(sessionDir)) {
+            console.log(`🗑️ [${sessionId}] Removing old session directory (ensuring fresh start)`);
+            removeFile(sessionDir);
+        }
+        fs.mkdirSync(sessionDir, { recursive: true });
+        
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        authState = state;
+        saveCredsFn = saveCreds;
+        version = await getCachedVersion();
+        
+        // Log session state for debugging
+        const hasExistingCreds = authState?.creds !== undefined;
+        const isRegistered = authState?.creds?.registered === true;
+        console.log(`[${sessionId}] Existing creds file: ${hasExistingCreds}`);
+        console.log(`[${sessionId}] Session registered: ${isRegistered}`);
+        
+        // Create socket
+        sock = makeWASocket({
+            version,
+            auth: authState,
+            printQRInTerminal: true,
+            browser: Browsers.ubuntu("GleBot"),
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
+            keepAliveIntervalMs: 30000,
+            defaultQueryTimeoutMs: 60000,
+            connectTimeoutMs: 60000
+        });
+        
         // Handle credentials update
-        socket.ev.on('creds.update', () => {
+        sock.ev.on('creds.update', () => {
             console.log(`💾 [${sessionId}] creds.update`);
             if (saveCredsFn) saveCredsFn();
         });
         
-        // Handle connection updates
-        socket.ev.on('connection.update', async (update) => {
-            if (sessionExported || cleaned) return;
-            
+        // Handle connection updates - exactly like qr.js
+        sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
+            console.log(`[${sessionId}] Connection: ${connection}`);
             
-            console.log(`[${sessionId}] Connection state: ${connection || 'connecting'}`);
-            
-            // Handle successful connection
-            if (connection === 'open' && socket?.user?.id && !userConnected) {
+            // Post-link tasks on connection === 'open'
+            if (connection === 'open' && sock?.user?.id && !userConnected) {
+                connectionEstablished = true;
                 userConnected = true;
                 console.log(`🎉 [${sessionId}] USER CONNECTED!`);
-                console.log(`👤 User: ${socket.user.id}`);
-                
-                // Wait for creds to be saved
-                await delay(3000);
+                console.log(`👤 User: ${sock.user.id}`);
                 
                 try {
-                    const credsBase64 = getCredsFile(sessionDir);
+                    // Wait for creds to be saved
+                    await delay(2000);
                     
+                    const credsBase64 = getCredsFile(sessionDir);
                     if (!credsBase64) {
-                        throw new Error('creds.json not found');
+                        throw new Error('creds.json not found after connection');
                     }
                     
                     const sessionString = encryptSession(credsBase64, sessionId);
@@ -289,27 +263,13 @@ router.get('/', async (req, res) => {
                     fs.writeFileSync(sessionFile, sessionString);
                     
                     console.log(`📤 [${sessionId}] Sending session...`);
-                    const userJid = numberToUse + '@s.whatsapp.net';
+                    const userJid = number + '@s.whatsapp.net';
                     
-                    // Split session if too long
-                    if (sessionString.length > 60000) {
-                        const chunks = [];
-                        for (let i = 0; i < sessionString.length; i += 60000) {
-                            chunks.push(sessionString.slice(i, i + 60000));
-                        }
-                        
-                        for (let i = 0; i < chunks.length; i++) {
-                            await delay(1000);
-                            await socket.sendMessage(userJid, { 
-                                text: `📦 *Session Part ${i+1}/${chunks.length}*\n\n${chunks[i]}` 
-                            });
-                        }
-                    } else {
-                        await socket.sendMessage(userJid, { text: sessionString });
-                    }
+                    // Send session
+                    await sock.sendMessage(userJid, { text: sessionString });
                     
                     // Send warning and channel link
-                    await socket.sendMessage(userJid, {
+                    await sock.sendMessage(userJid, {
                         text: `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
 ┌┤✑  Thanks for using GleBot
@@ -333,178 +293,96 @@ router.get('/', async (req, res) => {
                     console.log(`✅ [${sessionId}] Session sent successfully`);
                     sessionExported = true;
                     
-                    // Mega backup
+                    // Mega backup (background)
                     (async () => {
                         try {
                             const megaUrl = await uploadSession(sessionString, sessionId);
-                            if (megaUrl && !megaUrl.startsWith('local://') && socket?.user) {
-                                await socket.sendMessage(userJid, {
-                                    text: `💾 *Mega Backup*\n\n${megaUrl}`
-                                });
+                            if (megaUrl && !megaUrl.startsWith('local://') && sock?.user) {
+                                await sock.sendMessage(userJid, { text: `💾 *Mega Backup*\n\n${megaUrl}` });
                             }
-                        } catch (e) {}
+                        } catch (e) {
+                            console.error(`Mega backup failed:`, e.message);
+                        }
                     })();
-                    
-                    setTimeout(() => cleanup(), 30000);
                     
                 } catch (err) {
                     console.error(`❌ [${sessionId}] Export failed:`, err);
+                }
+            }
+            
+            // Handle close - check if it was a logout
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+                
+                console.log(`🔴 [${sessionId}] Connection closed, code: ${statusCode}, loggedOut: ${isLoggedOut}`);
+                
+                // If user logged out, we need to cleanup and allow new pairing
+                if (isLoggedOut && !sessionExported) {
+                    console.log(`⚠️ [${sessionId}] User logged out - clearing session for fresh pairing`);
                     cleanup();
                 }
             }
-            
-            // Handle disconnection
-            if (connection === 'close' && !sessionExported && !userConnected) {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                console.log(`🔴 [${sessionId}] Connection closed with code: ${statusCode}`);
-                if (!responseSent) {
-                    sendResponse({ 
-                        success: false, 
-                        error: 'Connection failed. Please try again.',
-                        sessionId 
-                    });
-                }
-                cleanup();
-            }
         });
-    };
-    
-    try {
-        if (!number) {
-            return res.status(400).json({ success: false, error: 'Phone number required', sessionId });
+        
+        // Always request pairing code for a fresh session
+        // We deleted the old session directory, so it's definitely fresh
+        console.log(`⏳ [${sessionId}] Waiting 2 seconds for socket to initialize...`);
+        await delay(2000);
+        
+        console.log(`🔑 [${sessionId}] Requesting pairing code for ${number}...`);
+        pairingRequested = true;
+        
+        try {
+            const code = await sock.requestPairingCode(number);
+            
+            if (code) {
+                // Format code with hyphens for display
+                const formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
+                console.log(`✅ [${sessionId}] Pairing code: ${formattedCode}`);
+                
+                sendResponse({
+                    success: true,
+                    code: formattedCode,
+                    rawCode: code,
+                    sessionId,
+                    phoneNumber: number,
+                    baseUrl: BASE_URL,
+                    message: 'Enter this code in WhatsApp',
+                    instructions: [
+                        '1. Open WhatsApp on your phone',
+                        '2. Go to Settings → Linked Devices',
+                        '3. Tap "Link a Device"',
+                        `4. Enter this code: ${formattedCode}`,
+                        '5. Wait for connection...'
+                    ],
+                    note: 'Code expires in 2 minutes'
+                });
+            } else {
+                throw new Error('No code received from WhatsApp');
+            }
+            
+        } catch (error) {
+            // Log EVERY error from requestPairingCode
+            console.error(`❌ [${sessionId}] requestPairingCode() ERROR:`);
+            console.error(`   Message: ${error.message}`);
+            console.error(`   Stack: ${error.stack}`);
+            
+            sendResponse({
+                success: false,
+                error: `Pairing failed: ${error.message}`,
+                sessionId,
+                fallback: true,
+                message: 'Pairing code failed. Check server logs.'
+            });
+            cleanup();
+            return;
         }
         
-        // Format phone number globally
-        formattedNumber = formatPhoneNumber(number);
-        
-        fs.mkdirSync(sessionDir, { recursive: true });
-        
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        authState = state;
-        saveCredsFn = saveCreds;
-        version = await getCachedVersion();
-        
-        // Create socket with proper configuration
-        sock = makeWASocket({
-            version,
-            auth: authState,
-            printQRInTerminal: false,
-            browser: Browsers.ubuntu("GleBot"),
-            syncFullHistory: false,
-            markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000,
-            defaultQueryTimeoutMs: 60000,
-            connectTimeoutMs: 60000,
-            patchMessageBeforeSending: (message) => message
-        });
-        
-        attachEvents(sock, formattedNumber);
-        
-        // Wait for socket to be ready and request pairing code
-        const requestPairing = async () => {
-            // Wait for socket to establish connection
-            let attempts = 0;
-            let isReady = false;
-            
-            while (attempts < 30 && !isReady && !userConnected && !cleaned) {
-                await delay(1000);
-                attempts++;
-                
-                // Check if socket is ready
-                if (sock?.ws?.readyState === 1) {
-                    isReady = true;
-                    console.log(`✅ [${sessionId}] Socket ready after ${attempts}s`);
-                }
-            }
-            
-            if (!isReady || userConnected || cleaned) {
-                console.log(`⚠️ [${sessionId}] Socket not ready after ${attempts}s`);
-                if (!responseSent) {
-                    sendResponse({
-                        success: true,
-                        fallback: true,
-                        sessionId,
-                        message: 'Please scan QR code below',
-                        qr: 'QR will appear in console'
-                    });
-                }
-                return;
-            }
-            
-            try {
-                console.log(`🔑 [${sessionId}] Requesting pairing code for ${formattedNumber}...`);
-                
-                // Request pairing code
-                const code = await sock.requestPairingCode(formattedNumber);
-                
-                if (code) {
-                    // Format code for display
-                    let formattedCode;
-                    if (code.length === 8) {
-                        formattedCode = `${code.slice(0,3)}-${code.slice(3,6)}-${code.slice(6)}`;
-                    } else if (code.length === 10) {
-                        formattedCode = `${code.slice(0,4)}-${code.slice(4,8)}-${code.slice(8)}`;
-                    } else {
-                        formattedCode = code.match(/.{1,4}/g)?.join('-') || code;
-                    }
-                    
-                    codeSent = true;
-                    
-                    console.log(`✅ [${sessionId}] Pairing code: ${formattedCode}`);
-                    
-                    sendResponse({
-                        success: true,
-                        code: formattedCode,
-                        rawCode: code,
-                        sessionId,
-                        phoneNumber: `+${formattedNumber}`,
-                        baseUrl: BASE_URL,
-                        message: 'Enter this code in WhatsApp',
-                        instructions: [
-                            '1. Open WhatsApp on your phone',
-                            '2. Go to Settings → Linked Devices',
-                            '3. Tap "Link a Device"',
-                            `4. Enter this code: ${formattedCode}`,
-                            '5. Wait for connection...'
-                        ],
-                        expiresIn: 120
-                    });
-                    
-                    // Set timeout for connection
-                    setTimeout(() => {
-                        if (!userConnected && !sessionExported && !cleaned) {
-                            console.log(`⏰ [${sessionId}] No connection after code sent`);
-                            cleanup();
-                        }
-                    }, 120000);
-                    
-                } else {
-                    throw new Error('No code received from WhatsApp');
-                }
-                
-            } catch (error) {
-                console.error(`❌ [${sessionId}] Pairing error:`, error.message);
-                
-                // Fallback to QR
-                if (!responseSent) {
-                    sendResponse({
-                        success: true,
-                        fallback: true,
-                        sessionId,
-                        message: 'Pairing code failed, please scan QR code',
-                        qr: 'QR will appear in console'
-                    });
-                }
-            }
-        };
-        
-        // Start pairing after a short delay
-        setTimeout(() => requestPairing(), 3000);
-        
-        // Set overall timeout
+        // Single timeout: 180 seconds, no premature cleanup
         setTimeout(() => {
             if (!sessionExported && !cleaned) {
-                console.log(`⏰ [${sessionId}] Overall timeout`);
+                console.log(`⏰ [${sessionId}] Timeout after 180s`);
                 if (!responseSent) {
                     sendResponse({ 
                         success: false, 
@@ -519,7 +397,7 @@ router.get('/', async (req, res) => {
     } catch (error) {
         console.error(`❌ [${sessionId}] Fatal error:`, error);
         if (!responseSent && !cleaned) {
-            res.status(400).json({ success: false, error: error.message, sessionId });
+            res.status(500).json({ success: false, error: error.message, sessionId });
         }
         cleanup();
     }
@@ -544,8 +422,7 @@ router.get('/status', (req, res) => {
         success: true,
         activeSessions: sessions,
         maxSessions: MAX_SESSIONS,
-        baseUrl: BASE_URL,
-        port: PORT
+        baseUrl: BASE_URL
     });
 });
 
