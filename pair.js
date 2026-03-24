@@ -68,13 +68,11 @@ router.get('/', async (req, res) => {
     let sock = null;
     
     try {
-        // 1. Setup auth state
+        // Setup auth state
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        
-        // 2. Get latest version
         const { version } = await fetchLatestBaileysVersion();
         
-        // 3. Create socket - THIS IS THE CORRECT ARCHITECTURE
+        // Create socket
         sock = makeWASocket({
             version,
             auth: state,
@@ -84,15 +82,13 @@ router.get('/', async (req, res) => {
             markOnlineOnConnect: false
         });
         
-        // 4. Handle credentials update
         sock.ev.on('creds.update', saveCreds);
         
-        // 5. Handle connection - THIS IS THE CORRECT ORDER
+        // Handle connection when user enters code
         sock.ev.on('connection.update', async (update) => {
             const { connection } = update;
             console.log(`📡 Connection: ${connection}`);
             
-            // When user enters code, this fires
             if (connection === 'open') {
                 console.log('✅ User connected!');
                 try {
@@ -102,7 +98,6 @@ router.get('/', async (req, res) => {
                     
                     await sock.sendMessage(userJid, { text: sessionString });
                     console.log('📤 Session sent');
-                    
                     await sock.sendMessage(userJid, { text: MESSAGE });
                     
                     await delay(2000);
@@ -114,15 +109,45 @@ router.get('/', async (req, res) => {
             }
         });
         
-        // 6. Request pairing code - THIS IS THE KEY: MUST HAPPEN AFTER SOCKET CREATION
-        // The socket connects automatically, we just need to wait a moment
-        console.log('🔑 Requesting pairing code...');
-        await delay(2000);
-        let code = await sock.requestPairingCode(whatsappNumber);
-        code = code?.match(/.{1,4}/g)?.join('-') || code;
+        // WAIT FOR SOCKET TO BE READY BEFORE REQUESTING PAIRING CODE
+        console.log('⏳ Waiting for socket to connect...');
         
-        console.log(`✅ Pairing code: ${code}`);
-        res.json({ success: true, code: code });
+        // Wait for the socket to be connected to WhatsApp servers
+        let isConnected = false;
+        await new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+                console.log('⚠️ Socket connection timeout, proceeding anyway');
+                resolve();
+            }, 10000);
+            
+            sock.ev.on('connection.update', (update) => {
+                if (update.connection === 'connecting') {
+                    console.log('✅ Socket connected to WhatsApp, ready for pairing');
+                    isConnected = true;
+                    clearTimeout(timeout);
+                    resolve();
+                }
+            });
+        });
+        
+        // NOW request the REAL pairing code from WhatsApp
+        console.log(`🔑 Requesting REAL pairing code from WhatsApp for ${whatsappNumber}...`);
+        let code = await sock.requestPairingCode(whatsappNumber);
+        
+        // Format the code for display (WhatsApp sends a numeric code)
+        const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+        
+        console.log(`✅ REAL pairing code from WhatsApp: ${formattedCode}`);
+        
+        if (!responseSent) {
+            responseSent = true;
+            res.json({ 
+                success: true, 
+                code: formattedCode,
+                rawCode: code,
+                message: 'Enter this code in WhatsApp: Settings → Linked Devices → Link a Device'
+            });
+        }
         
         // Cleanup after 2 minutes
         setTimeout(async () => {
