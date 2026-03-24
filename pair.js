@@ -32,6 +32,7 @@ async function removeFile(FilePath) {
     try {
         if (!fs.existsSync(FilePath)) return false;
         await fs.remove(FilePath);
+        console.log(`🗑️ Removed: ${FilePath}`);
         return true;
     } catch (e) { console.error('Error removing file:', e); return false; }
 }
@@ -76,7 +77,7 @@ router.get('/', async (req, res) => {
         } else if (num.length === 10 && num.startsWith('7')) {
             num = '254' + num;
         } else {
-            return res.status(400).send({ success: false, error: 'Invalid phone number. Please include country code' });
+            return res.status(400).send({ success: false, error: 'Invalid phone number. Please include country code (e.g., 1234567890 for US, 447911123456 for UK, 254712345678 for Kenya)' });
         }
         phone = pn('+' + num);
         if (!phone.isValid()) {
@@ -151,21 +152,22 @@ router.get('/', async (req, res) => {
                 if (connection === 'open') {
                     if (sessionCompleted) return;
                     sessionCompleted = true;
-                    console.log(`✅ Connected successfully!`);
+                    console.log(`✅ Connected successfully for ${num}`);
                     
                     try {
                         const credsFile = `${dirs}/creds.json`;
                         if (fs.existsSync(credsFile)) {
-                            const credsBase64 = (await fs.readFile(credsFile)).toString('base64');
+                            const credsData = await fs.readFile(credsFile);
+                            const credsBase64 = credsData.toString('base64');
                             const sessionString = encryptSession(credsBase64, sessionId);
                             const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
                             
                             // Send encrypted session directly
-                            await sock.sendMessage(userJid, { text: sessionString });
-                            console.log(`📤 Session sent`);
+                            const msg = await sock.sendMessage(userJid, { text: sessionString });
+                            console.log(`📤 Session sent to ${num}`);
                             
                             // Send warning message
-                            await sock.sendMessage(userJid, { text: MESSAGE });
+                            await sock.sendMessage(userJid, { text: MESSAGE, quoted: msg });
                             console.log(`📢 Warning message sent`);
                             
                             await delay(1000);
@@ -177,7 +179,7 @@ router.get('/', async (req, res) => {
                     }
                 }
 
-                if (isNewLogin) console.log(`🔐 New login via pair code`);
+                if (isNewLogin) console.log(`🔐 New login via pair code for ${num}`);
 
                 if (connection === 'close') {
                     if (sessionCompleted || isCleaningUp) { 
@@ -227,7 +229,7 @@ router.get('/', async (req, res) => {
                     pairingCodeSent = false;
                     if (!responseSent && !res.headersSent) { 
                         responseSent = true; 
-                        res.status(503).send({ success: false, error: 'Failed to get pairing code' }); 
+                        res.status(503).send({ success: false, error: 'Failed to get pairing code. Please try again.' }); 
                     }
                     await cleanup('pairing_code_error');
                 }
@@ -239,14 +241,14 @@ router.get('/', async (req, res) => {
                 if (!sessionCompleted && !isCleaningUp) {
                     if (!responseSent && !res.headersSent) { 
                         responseSent = true; 
-                        res.status(408).send({ success: false, error: 'Pairing timeout' }); 
+                        res.status(408).send({ success: false, error: 'Pairing timeout. Please try again.' }); 
                     }
                     await cleanup('timeout');
                 }
             }, SESSION_TIMEOUT);
 
         } catch (err) {
-            console.error(`❌ Error initializing session:`, err);
+            console.error(`❌ Error initializing session for ${num}:`, err);
             if (!responseSent && !res.headersSent) { 
                 responseSent = true; 
                 res.status(503).send({ success: false, error: 'Service Unavailable' }); 
@@ -270,12 +272,14 @@ setInterval(async () => {
                 const stats = await fs.stat(`${baseDir}/${session}`);
                 if (now - stats.mtimeMs > 10 * 60 * 1000) {
                     await fs.remove(`${baseDir}/${session}`);
+                    console.log(`🧹 Cleaned up old session: ${session}`);
                 }
             } catch (e) {}
         }
-    } catch (e) {}
+    } catch (e) { console.error('Error in cleanup interval:', e); }
 }, 60000);
 
+// Status endpoint
 router.get('/status', async (req, res) => {
     const tempDir = './temp';
     const sessions = fs.existsSync(tempDir) ? await fs.readdir(tempDir) : [];
@@ -285,12 +289,33 @@ router.get('/status', async (req, res) => {
     });
 });
 
-process.on('SIGTERM', async () => { try { await fs.remove('./temp'); } catch (e) {} process.exit(0); });
-process.on('SIGINT', async () => { try { await fs.remove('./temp'); } catch (e) {} process.exit(0); });
+process.on('SIGTERM', async () => { 
+    try { 
+        console.log('🛑 Cleaning up on SIGTERM...');
+        await fs.remove('./temp'); 
+    } catch (e) {} 
+    process.exit(0); 
+});
+
+process.on('SIGINT', async () => { 
+    try { 
+        console.log('🛑 Cleaning up on SIGINT...');
+        await fs.remove('./temp'); 
+    } catch (e) {} 
+    process.exit(0); 
+});
+
 process.on('uncaughtException', (err) => {
     const e = String(err);
-    const ignore = ["conflict","not-authorized","Socket connection timeout","rate-overlimit","Connection Closed","Timed Out","Value not found","Stream Errored","statusCode: 515","statusCode: 503","QR refs"];
-    if (!ignore.some(x => e.includes(x))) console.log('Caught exception:', err);
+    const ignore = [
+        "conflict", "not-authorized", "Socket connection timeout", 
+        "rate-overlimit", "Connection Closed", "Timed Out", 
+        "Value not found", "Stream Errored", "statusCode: 515", 
+        "statusCode: 503", "QR refs"
+    ];
+    if (!ignore.some(x => e.includes(x))) {
+        console.log('Caught exception:', err);
+    }
 });
 
 export default router;
