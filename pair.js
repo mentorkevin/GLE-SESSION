@@ -13,6 +13,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',') || [];
 const MAX_CONCURRENT_PAIRINGS = parseInt(process.env.MAX_CONCURRENT_PAIRINGS) || 10;
+const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 100;
 const PAIRING_TIMEOUT = 120000; // 2 minutes
 const PAIRING_CODE_TIMEOUT = 30000;
 const MAX_MESSAGE_SIZE = 8192;
@@ -47,11 +48,11 @@ if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
-const MAX_SESSIONS = 100;
 const CLEANUP_AGE = 3600000;
 const RATE_LIMIT_MAP = new Map();
 const ACTIVE_NUMBERS = new Map();
 let activePairingCount = 0;
+const activePairingLock = new Map(); // For precise counter management
 
 let cachedVersion = null;
 let versionCacheTime = 0;
@@ -141,14 +142,24 @@ function checkRateLimit(ip, phoneNumber) {
 function formatPhoneNumber(number) {
     let cleaned = number.replace(/\D/g, '');
     
+    // Check for valid country code patterns first
     for (const { pattern } of COUNTRY_PATTERNS) {
         if (pattern.test(cleaned)) return cleaned;
     }
     
-    if (cleaned.length === 10 && !cleaned.startsWith('1')) cleaned = '1' + cleaned;
-    else if (cleaned.length === 9 && cleaned.startsWith('7')) cleaned = '254' + cleaned;
-    else if (cleaned.length === 10 && cleaned.startsWith('7')) cleaned = '254' + cleaned;
-    else if (cleaned.length === 11 && cleaned.startsWith('0')) cleaned = cleaned.substring(1);
+    // Handle common cases with better detection
+    if (cleaned.length === 10 && cleaned.startsWith('0')) {
+        // Remove leading 0 and try to detect country
+        cleaned = cleaned.substring(1);
+    }
+    
+    if (cleaned.length === 9 && cleaned.startsWith('7')) {
+        cleaned = '254' + cleaned; // Kenya
+    } else if (cleaned.length === 10 && cleaned.startsWith('7')) {
+        cleaned = '254' + cleaned; // Kenya
+    } else if (cleaned.length === 10 && !cleaned.startsWith('1')) {
+        cleaned = '1' + cleaned; // US/CA fallback
+    }
     
     return cleaned;
 }
@@ -160,22 +171,44 @@ function redactNumber(number) {
     return number.substring(0, 2) + '****' + number.substring(len - 2);
 }
 
-// Cleanup intervals
+// Cleanup old session directories
 setInterval(() => {
     try {
         if (!fs.existsSync(TEMP_DIR)) return;
         const files = fs.readdirSync(TEMP_DIR);
         const now = Date.now();
+        let sessionCount = 0;
+        
         for (const file of files) {
             const filePath = path.join(TEMP_DIR, file);
             try {
                 const stat = fs.statSync(filePath);
-                if (now - stat.mtimeMs > CLEANUP_AGE) removeFile(filePath, true);
+                if (now - stat.mtimeMs > CLEANUP_AGE) {
+                    removeFile(filePath, true);
+                } else {
+                    sessionCount++;
+                }
             } catch (e) {}
+        }
+        
+        // Enforce MAX_SESSIONS limit
+        if (sessionCount > MAX_SESSIONS) {
+            console.log(`⚠️ Session count (${sessionCount}) exceeds limit (${MAX_SESSIONS}), cleaning oldest...`);
+            const sessions = files
+                .map(f => ({ name: f, path: path.join(TEMP_DIR, f) }))
+                .filter(f => fs.existsSync(f.path))
+                .map(f => ({ ...f, stat: fs.statSync(f.path) }))
+                .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
+            
+            const toDelete = sessions.slice(0, sessionCount - MAX_SESSIONS);
+            for (const session of toDelete) {
+                removeFile(session.path, true);
+            }
         }
     } catch (e) {}
 }, 600000);
 
+// Clean up stale active sessions
 setInterval(() => {
     const now = Date.now();
     for (const [number, data] of ACTIVE_NUMBERS.entries()) {
@@ -183,9 +216,14 @@ setInterval(() => {
             console.log(`🧹 Cleaning up stale active session for ${redactNumber(number)}`);
             if (data.cleanupTimeout) clearTimeout(data.cleanupTimeout);
             ACTIVE_NUMBERS.delete(number);
+            
+            // Decrement counter if this session was counted
+            if (activePairingLock.has(data.sessionId)) {
+                activePairingCount = Math.max(0, activePairingCount - 1);
+                activePairingLock.delete(data.sessionId);
+            }
         }
     }
-    if (activePairingCount < 0) activePairingCount = 0;
 }, 60000);
 
 setInterval(() => {
@@ -267,8 +305,13 @@ router.get('/', async (req, res) => {
     let exportInProgress = false;
     let connectionListener = null;
     let credsListener = null;
-    let pairingCodeResolved = false;
+    let megaTimer = null;
+    let cleanupTimer = null;
+    let activeTimer = null;
+    let credsFileWritten = false;
     
+    // Track this session for counter management
+    activePairingLock.set(sessionId, true);
     activePairingCount++;
     console.log(`📊 Active pairings: ${activePairingCount}`);
     
@@ -277,8 +320,11 @@ router.get('/', async (req, res) => {
         cleaned = true;
         console.log(`🧹 [${sessionId}] Cleanup scheduled`);
         
-        activePairingCount = Math.max(0, activePairingCount - 1);
+        // Clear all timers
+        if (megaTimer) clearTimeout(megaTimer);
+        if (cleanupTimer) clearTimeout(cleanupTimer);
         
+        // Remove from active numbers with proper cleanup
         if (ACTIVE_NUMBERS.has(formattedNumber)) {
             const active = ACTIVE_NUMBERS.get(formattedNumber);
             if (active.cleanupTimeout) clearTimeout(active.cleanupTimeout);
@@ -286,6 +332,14 @@ router.get('/', async (req, res) => {
             console.log(`🗑️ [${sessionId}] Removed ${redactedNumber} from active sessions`);
         }
         
+        // Decrement counter safely
+        if (activePairingLock.has(sessionId)) {
+            activePairingCount = Math.max(0, activePairingCount - 1);
+            activePairingLock.delete(sessionId);
+            console.log(`📊 Active pairings after cleanup: ${activePairingCount}`);
+        }
+        
+        // Remove listeners
         if (currentSock) {
             if (connectionListener) currentSock.ev.off('connection.update', connectionListener);
             if (credsListener) currentSock.ev.off('creds.update', credsListener);
@@ -293,8 +347,11 @@ router.get('/', async (req, res) => {
             try { currentSock.end(); } catch (e) {}
         }
         
+        // Schedule directory removal
         if (sessionDirCreated && fs.existsSync(sessionDir)) {
-            setTimeout(() => removeFile(sessionDir, true), 10000);
+            setTimeout(() => {
+                if (fs.existsSync(sessionDir)) removeFile(sessionDir, true);
+            }, delayMs);
         }
     };
     
@@ -303,6 +360,22 @@ router.get('/', async (req, res) => {
             responseSent = true;
             res.json(data);
         }
+    };
+    
+    // Wait for creds.json to be written (with timeout)
+    const waitForCredsFile = (timeoutMs = 10000) => {
+        return new Promise((resolve) => {
+            const startTime = Date.now();
+            const checkInterval = setInterval(() => {
+                if (fs.existsSync(path.join(sessionDir, 'creds.json'))) {
+                    clearInterval(checkInterval);
+                    resolve(true);
+                } else if (Date.now() - startTime > timeoutMs) {
+                    clearInterval(checkInterval);
+                    resolve(false);
+                }
+            }, 500);
+        });
     };
     
     // Send session with safe chunk size
@@ -349,6 +422,12 @@ router.get('/', async (req, res) => {
                 return { success: false, error: 'Phone number mismatch' };
             }
             
+            // Wait for creds.json to be written
+            const credsExist = await waitForCredsFile();
+            if (!credsExist) {
+                throw new Error('creds.json not found after waiting');
+            }
+            
             const credsBase64 = getCredsFile(sessionDir);
             if (!credsBase64) throw new Error('creds.json not found');
             
@@ -378,20 +457,46 @@ router.get('/', async (req, res) => {
         }
     };
     
-    try {
-        // Register active session with auto-cleanup
-        const cleanupTimeout = setTimeout(() => {
-            if (ACTIVE_NUMBERS.has(formattedNumber)) {
-                console.log(`⏰ [${sessionId}] Active session auto-cleaned`);
-                ACTIVE_NUMBERS.delete(formattedNumber);
+    // Request pairing code with retry
+    const requestPairingWithRetry = async (socket, phoneNumber, maxRetries = 3) => {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                console.log(`🔑 [${sessionId}] Requesting pairing code (attempt ${attempt}/${maxRetries})...`);
+                
+                // Small delay before first attempt to allow initialization
+                if (attempt === 1) await delay(2000);
+                
+                const code = await Promise.race([
+                    socket.requestPairingCode(phoneNumber),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), PAIRING_CODE_TIMEOUT))
+                ]);
+                
+                if (code) return { success: true, code };
+                
+            } catch (err) {
+                console.error(`❌ [${sessionId}] Attempt ${attempt} failed:`, err.message);
+                if (attempt < maxRetries) {
+                    await delay(3000);
+                }
             }
-        }, PAIRING_TIMEOUT);
+        }
+        return { success: false, error: 'All pairing attempts failed' };
+    };
+    
+    try {
+        // Register active session with extended timeout to prevent early removal
+        activeTimer = setTimeout(() => {
+            if (ACTIVE_NUMBERS.has(formattedNumber) && !sessionExported) {
+                console.log(`⏰ [${sessionId}] Active session timeout - extending`);
+                // Don't delete, just log - let the connection handler manage
+            }
+        }, PAIRING_TIMEOUT - 10000); // Warn 10 seconds before timeout
         
         ACTIVE_NUMBERS.set(formattedNumber, {
             sessionId,
             timestamp: Date.now(),
             ip: clientIp,
-            cleanupTimeout
+            cleanupTimeout: activeTimer
         });
         
         // Create session directory
@@ -406,11 +511,10 @@ router.get('/', async (req, res) => {
         
         console.log(`🔨 [${sessionId}] Creating socket...`);
         
-        // Create socket with correct browser
         currentSock = makeWASocket({
             version,
             auth: state,
-            browser: Browsers.macOS("Chrome"), // More reliable than Ubuntu
+            browser: Browsers.macOS("Chrome"),
             printQRInTerminal: false,
             markOnlineOnConnect: false,
             connectTimeoutMs: 60000,
@@ -418,9 +522,10 @@ router.get('/', async (req, res) => {
             keepAliveIntervalMs: 30000
         });
         
-        // Single creds listener
+        // Single creds listener with file tracking
         credsListener = async (creds) => {
             console.log(`💾 [${sessionId}] creds.update - registered: ${creds?.registered}`);
+            if (creds?.registered) credsFileWritten = true;
             try {
                 if (saveCredsFn) await saveCredsFn();
             } catch (err) {
@@ -435,6 +540,18 @@ router.get('/', async (req, res) => {
                 const { connection, lastDisconnect } = update;
                 
                 console.log(`[${sessionId}] Connection: ${connection || 'connecting'}`);
+                
+                // Handle all close scenarios
+                if (connection === 'close') {
+                    console.log(`⚠️ [${sessionId}] Connection closed`);
+                    
+                    // Check if we're already connected/exported
+                    if (!sessionExported && !userConnected) {
+                        // Don't cleanup immediately - let pairing retry handle it
+                        console.log(`[${sessionId}] Connection closed before pairing, waiting for retry...`);
+                    }
+                    return;
+                }
                 
                 if (lastDisconnect?.error) {
                     const statusCode = lastDisconnect.error?.output?.statusCode;
@@ -455,6 +572,8 @@ router.get('/', async (req, res) => {
                     
                     if (phoneMatches) {
                         userConnected = true;
+                        
+                        // Wait for creds file to be written
                         await delay(2000);
                         
                         const result = await exportSession(currentSock, sessionDir, sessionId, formattedNumber);
@@ -462,24 +581,34 @@ router.get('/', async (req, res) => {
                         if (result.success) {
                             sessionExported = true;
                             
+                            // Clear any pending cleanup
+                            if (cleanupTimer) clearTimeout(cleanupTimer);
+                            
+                            // Mega upload with safe socket check
                             if (!megaUploadStarted) {
                                 megaUploadStarted = true;
                                 const sessionStringCopy = result.sessionString;
-                                setTimeout(async () => {
+                                const userJidCopy = currentSock.user.id;
+                                
+                                megaTimer = setTimeout(async () => {
                                     try {
-                                        const megaUrl = await uploadSession(sessionStringCopy, sessionId);
-                                        if (megaUrl && !megaUrl.startsWith('local://') && currentSock?.user) {
-                                            await currentSock.sendMessage(currentSock.user.id, { 
-                                                text: `💾 *Mega Backup*\n\n${megaUrl}` 
-                                            });
+                                        // Check if socket still exists before sending
+                                        if (currentSock && !cleaned && currentSock.user) {
+                                            const megaUrl = await uploadSession(sessionStringCopy, sessionId);
+                                            if (megaUrl && !megaUrl.startsWith('local://')) {
+                                                await currentSock.sendMessage(userJidCopy, { 
+                                                    text: `💾 *Mega Backup*\n\n${megaUrl}` 
+                                                });
+                                            }
                                         }
                                     } catch (e) {
                                         console.error(`Mega failed:`, e.message);
                                     }
-                                }, 10000);
+                                }, 15000); // Longer delay to ensure cleanup doesn't interfere
                             }
                             
-                            setTimeout(() => cleanup(5000), 3000);
+                            // Success cleanup
+                            cleanupTimer = setTimeout(() => cleanup(5000), 5000);
                         }
                     }
                 }
@@ -489,45 +618,31 @@ router.get('/', async (req, res) => {
         };
         currentSock.ev.on('connection.update', connectionListener);
         
-        // REQUEST PAIRING CODE IMMEDIATELY - This is the correct flow
-        console.log(`🔑 [${sessionId}] Requesting pairing code...`);
+        // Request pairing code with retry
+        const pairingResult = await requestPairingWithRetry(currentSock, formattedNumber);
         
-        let pairingCode = null;
-        try {
-            // Race between pairing code and timeout
-            pairingCode = await Promise.race([
-                currentSock.requestPairingCode(formattedNumber),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('Pairing code request timeout')), PAIRING_CODE_TIMEOUT))
-            ]);
-        } catch (err) {
-            console.error(`❌ [${sessionId}] Pairing request failed:`, err.message);
+        if (!pairingResult.success) {
+            console.error(`❌ [${sessionId}] Pairing failed after retries`);
+            
+            // Check for device limit error
+            const isDeviceLimit = pairingResult.error?.includes('device') || pairingResult.error?.includes('limit');
             sendResponse({
                 success: false,
-                error: `Failed to request pairing code: ${err.message}`,
-                sessionId
+                error: isDeviceLimit ? 'Too many linked devices. Please remove one from WhatsApp settings.' : `Pairing failed: ${pairingResult.error}`,
+                sessionId,
+                code: isDeviceLimit ? 'DEVICE_LIMIT' : 'PAIRING_FAILED'
             });
             cleanup(5000);
             return;
         }
         
-        if (!pairingCode) {
-            console.error(`❌ [${sessionId}] No pairing code received`);
-            sendResponse({
-                success: false,
-                error: 'No pairing code received from WhatsApp',
-                sessionId
-            });
-            cleanup(5000);
-            return;
-        }
-        
-        const formattedCode = pairingCode.match(/.{1,4}/g)?.join('-') || pairingCode;
+        const formattedCode = pairingResult.code.match(/.{1,4}/g)?.join('-') || pairingResult.code;
         console.log(`✅ [${sessionId}] Pairing code: ${formattedCode}`);
         
         sendResponse({
             success: true,
             code: formattedCode,
-            rawCode: pairingCode,
+            rawCode: pairingResult.code,
             sessionId,
             phoneNumber: redactedNumber,
             message: 'Enter this code in WhatsApp',
@@ -541,7 +656,7 @@ router.get('/', async (req, res) => {
         });
         
         // Timeout for user to enter code
-        setTimeout(() => {
+        cleanupTimer = setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Timeout waiting for connection`);
                 if (!responseSent) {
@@ -580,9 +695,10 @@ router.get('/status', (req, res) => {
     const sessions = fs.existsSync(TEMP_DIR) ? fs.readdirSync(TEMP_DIR).length : 0;
     res.json({
         success: true,
-        activeSessions: sessions,
+        activeSessions: Math.min(sessions, MAX_SESSIONS),
         activePairings: ACTIVE_NUMBERS.size,
         maxConcurrentPairings: MAX_CONCURRENT_PAIRINGS,
+        maxSessions: MAX_SESSIONS,
         availableSlots: Math.max(0, MAX_CONCURRENT_PAIRINGS - activePairingCount)
     });
 });
