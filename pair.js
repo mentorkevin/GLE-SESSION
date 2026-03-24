@@ -32,14 +32,24 @@ const MESSAGE = `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
 📢 Join our channel: ${CHANNEL_LINK}`;
 
-function encryptSession(credsBase64) {
-    const compressed = zlib.deflateSync(credsBase64);
+// Generate PAIRING CODE (8-digit number user enters)
+function generatePairingCode() {
+    return Math.floor(10000000 + Math.random() * 90000000).toString();
+}
+
+// Create SESSION STRING (the GleBot!... that gets sent after pairing)
+function createSessionString(credsData) {
+    // Compress with gzip
+    const compressed = zlib.gzipSync(credsData);
     const compressedBase64 = compressed.toString('base64');
+    
+    // Encrypt with AES
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY_HASH, iv);
     let encrypted = cipher.update(compressedBase64, 'utf8', 'base64');
     encrypted += cipher.final('base64');
     const authTag = cipher.getAuthTag().toString('base64');
+    
     return `${SESSION_PREFIX}${iv.toString('base64')}:${encrypted}:${authTag}`;
 }
 
@@ -47,10 +57,8 @@ router.get('/', async (req, res) => {
     let num = req.query.number;
     if (!num) return res.status(400).json({ error: 'Phone number required' });
 
-    // Clean number
+    // Clean and validate number
     num = num.replace(/\D/g, '');
-    
-    // Validate
     const phone = pn('+' + num);
     if (!phone.isValid()) {
         if (num.length === 10 && !num.startsWith('1')) num = '1' + num;
@@ -69,11 +77,9 @@ router.get('/', async (req, res) => {
     let sock = null;
     
     try {
-        // Setup auth state
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const { version } = await fetchLatestBaileysVersion();
         
-        // Create socket with correct browser
         sock = makeWASocket({
             version,
             auth: state,
@@ -85,26 +91,24 @@ router.get('/', async (req, res) => {
         
         sock.ev.on('creds.update', saveCreds);
         
-        // Track state
-        let pairingCodeRequested = false;
-        
-        // Handle all connection updates
+        // Handle when user enters the PAIRING CODE and connects
         sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update;
-            console.log(`📡 Connection update: ${connection || 'unknown'}`);
+            const { connection } = update;
             
-            // Handle connection open (user entered code)
             if (connection === 'open') {
-                console.log('✅ User connected! Sending session...');
+                console.log('✅ User entered pairing code and connected!');
                 try {
                     const credsData = await fs.readFile(`${sessionDir}/creds.json`);
-                    const credsBase64 = credsData.toString('base64');
-                    const sessionString = encryptSession(credsBase64);
+                    
+                    // Create the SESSION STRING (not the pairing code)
+                    const sessionString = createSessionString(credsData);
                     const userJid = jidNormalizedUser(whatsappNumber + '@s.whatsapp.net');
                     
+                    // Send the SESSION STRING to the user
                     await sock.sendMessage(userJid, { text: sessionString });
-                    console.log('📤 Session sent');
+                    console.log('📤 Session string sent to user');
                     
+                    // Mega backup of session string
                     try {
                         const megaLink = await megaUpload(sessionString, sessionDir);
                         if (megaLink && !megaLink.startsWith('local://')) {
@@ -116,30 +120,18 @@ router.get('/', async (req, res) => {
                     await delay(2000);
                     await sock.end();
                     await fs.remove(sessionDir);
+                    console.log('✅ Session complete');
                 } catch (err) {
                     console.error('Error sending session:', err);
                 }
             }
-            
-            // Handle close
-            if (connection === 'close') {
-                console.log(`🔌 Connection closed`);
-                if (lastDisconnect?.error) {
-                    console.error(`Close reason: ${lastDisconnect.error.message}`);
-                }
-            }
         });
         
-        // Wait for connection to establish
+        // Wait for socket connection
         await new Promise((resolve) => {
-            const timeout = setTimeout(() => {
-                console.log('⚠️ Connection timeout, proceeding anyway');
-                resolve();
-            }, 10000);
-            
+            const timeout = setTimeout(() => resolve(), 10000);
             const handler = (update) => {
                 if (update.connection === 'connecting') {
-                    console.log('✅ Socket connected, ready for pairing');
                     clearTimeout(timeout);
                     sock.ev.off('connection.update', handler);
                     resolve();
@@ -148,29 +140,31 @@ router.get('/', async (req, res) => {
             sock.ev.on('connection.update', handler);
         });
         
-        // Request pairing code
-        console.log(`🔑 Requesting pairing code for ${whatsappNumber}...`);
-        let code = await sock.requestPairingCode(whatsappNumber);
-        const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+        // STEP 1: Generate the PAIRING CODE (8-digit number user will enter)
+        const pairingCode = generatePairingCode();
+        console.log(`🔑 PAIRING CODE: ${pairingCode}`);
         
-        console.log(`✅ Pairing code: ${formattedCode}`);
+        // STEP 2: Send the pairing code to WhatsApp
+        await sock.requestPairingCode(whatsappNumber, pairingCode);
+        
+        console.log(`✅ WhatsApp will send "${pairingCode}" to +${whatsappNumber}`);
+        console.log(`📱 User must enter: ${pairingCode} in WhatsApp → Settings → Linked Devices`);
         
         if (!responseSent) {
             responseSent = true;
             res.json({ 
                 success: true, 
-                code: formattedCode,
-                message: 'Enter this code in WhatsApp'
+                code: pairingCode,  // Return the PAIRING CODE to frontend
+                message: 'Enter this code in WhatsApp: Settings → Linked Devices → Link a Device'
             });
         }
         
-        // Cleanup after timeout
-        setTimeout(async () => {
-            try {
-                if (sock) await sock.end();
-                await fs.remove(sessionDir);
-            } catch (e) {}
-        }, 120000);
+        // Keep socket alive while user enters the pairing code
+        console.log('⏳ Waiting for user to enter pairing code (3 minutes)...');
+        await new Promise((resolve) => setTimeout(resolve, 180000));
+        
+        await sock.end();
+        await fs.remove(sessionDir);
         
     } catch (err) {
         console.error('❌ Error:', err.message);
@@ -190,7 +184,7 @@ setInterval(async () => {
         for (const session of sessions) {
             const path = `${dir}/${session}`;
             const stat = await fs.stat(path);
-            if (now - stat.mtimeMs > 10 * 60 * 1000) {
+            if (now - stat.mtimeMs > 30 * 60 * 1000) {
                 await fs.remove(path);
             }
         }
