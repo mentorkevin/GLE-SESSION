@@ -16,7 +16,7 @@ const MAX_CONCURRENT_PAIRINGS = parseInt(process.env.MAX_CONCURRENT_PAIRINGS) ||
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 100;
 const PAIRING_TIMEOUT = 120000;
 const PAIRING_CODE_TIMEOUT = 30000;
-const CONNECTION_STABILITY_DELAY = 5000; // 5 seconds to ensure connection is stable
+const REGISTRATION_WAIT_TIME = 10000; // 10 seconds to wait for registration
 const MAX_MESSAGE_SIZE = 8192;
 
 // CORS
@@ -26,9 +26,6 @@ router.use((req, res, next) => {
         res.header('Access-Control-Allow-Origin', origin);
         res.header('Access-Control-Allow-Methods', 'GET');
         res.header('Access-Control-Allow-Headers', 'Content-Type');
-        next();
-    } else if (!origin && process.env.NODE_ENV === 'development') {
-        res.header('Access-Control-Allow-Origin', '*');
         next();
     } else {
         res.header('Access-Control-Allow-Origin', '*');
@@ -271,6 +268,77 @@ const splitSessionIntoChunks = (sessionString) => {
     return chunks;
 };
 
+// Wait for registration to complete before requesting pairing code
+const waitForRegistrationComplete = (socket, sessionId, timeoutMs = 30000) => {
+    return new Promise((resolve, reject) => {
+        let resolved = false;
+        let registrationTimer = null;
+        
+        const timeout = setTimeout(() => {
+            if (!resolved) {
+                console.log(`⚠️ [${sessionId}] Registration timeout after ${timeoutMs}ms`);
+                if (handler) socket.ev.off('connection.update', handler);
+                reject(new Error('Registration timeout - WhatsApp not ready'));
+            }
+        }, timeoutMs);
+        
+        const handler = (update) => {
+            const { connection, lastDisconnect } = update;
+            
+            console.log(`[${sessionId}] Registration state: ${connection || 'waiting'}`);
+            
+            // Registration is complete when we have a username or after connection is established with device pairing
+            if (update.username || (connection === 'connecting' && update.user)) {
+                if (!resolved) {
+                    resolved = true;
+                    clearTimeout(timeout);
+                    if (registrationTimer) clearTimeout(registrationTimer);
+                    socket.ev.off('connection.update', handler);
+                    console.log(`✅ [${sessionId}] Device registration complete`);
+                    resolve();
+                }
+                return;
+            }
+            
+            // If we get a close event, reject
+            if (connection === 'close') {
+                if (!resolved) {
+                    resolved = true;
+                    clearTimeout(timeout);
+                    if (registrationTimer) clearTimeout(registrationTimer);
+                    socket.ev.off('connection.update', handler);
+                    reject(new Error('Connection closed during registration'));
+                }
+                return;
+            }
+            
+            // After "connected to WA", wait for registration to complete
+            if (connection === 'connecting' && !registrationTimer) {
+                console.log(`[${sessionId}] Connected to WA, waiting for registration to complete...`);
+                registrationTimer = setTimeout(() => {
+                    if (!resolved) {
+                        resolved = true;
+                        clearTimeout(timeout);
+                        socket.ev.off('connection.update', handler);
+                        console.log(`✅ [${sessionId}] Registration assumed complete after wait`);
+                        resolve();
+                    }
+                }, REGISTRATION_WAIT_TIME);
+            }
+            
+            if (lastDisconnect?.error && !resolved) {
+                resolved = true;
+                clearTimeout(timeout);
+                if (registrationTimer) clearTimeout(registrationTimer);
+                socket.ev.off('connection.update', handler);
+                reject(new Error(`Connection error: ${lastDisconnect.error.message}`));
+            }
+        };
+        
+        socket.ev.on('connection.update', handler);
+    });
+};
+
 // ==================== HEALTH CHECK ENDPOINT ====================
 router.get('/health', (req, res) => {
     res.status(200).json({
@@ -391,67 +459,6 @@ router.get('/', async (req, res) => {
         }
     };
     
-    // Wait for stable connection (not just handshake)
-    const waitForStableConnection = (socket, stabilityMs = CONNECTION_STABILITY_DELAY) => {
-        return new Promise((resolve, reject) => {
-            let resolved = false;
-            let connectionTimer = null;
-            let connectionEstablished = false;
-            
-            const timeout = setTimeout(() => {
-                if (!resolved) {
-                    console.log(`⚠️ [${sessionId}] Connection timeout`);
-                    if (handshakeHandler) socket.ev.off('connection.update', handshakeHandler);
-                    reject(new Error('Connection timeout - WhatsApp not responding'));
-                }
-            }, 30000);
-            
-            const handshakeHandler = (update) => {
-                const { connection, lastDisconnect } = update;
-                
-                console.log(`[${sessionId}] Connection update: ${connection || 'unknown'}`);
-                
-                // If we get a close event, reject immediately
-                if (connection === 'close') {
-                    if (!resolved) {
-                        resolved = true;
-                        clearTimeout(timeout);
-                        if (connectionTimer) clearTimeout(connectionTimer);
-                        socket.ev.off('connection.update', handshakeHandler);
-                        reject(new Error('Connection closed before stable'));
-                    }
-                    return;
-                }
-                
-                // When we get "connecting", wait to ensure stability
-                if (connection === 'connecting' && !connectionEstablished) {
-                    console.log(`[${sessionId}] Got connecting, waiting ${stabilityMs/1000}s for stability...`);
-                    connectionEstablished = true;
-                    
-                    connectionTimer = setTimeout(() => {
-                        if (!resolved) {
-                            resolved = true;
-                            clearTimeout(timeout);
-                            socket.ev.off('connection.update', handshakeHandler);
-                            console.log(`✅ [${sessionId}] Connection stable after ${stabilityMs/1000}s`);
-                            resolve();
-                        }
-                    }, stabilityMs);
-                }
-                
-                if (lastDisconnect?.error && !resolved) {
-                    resolved = true;
-                    clearTimeout(timeout);
-                    if (connectionTimer) clearTimeout(connectionTimer);
-                    socket.ev.off('connection.update', handshakeHandler);
-                    reject(new Error(`Connection error: ${lastDisconnect.error.message}`));
-                }
-            };
-            
-            socket.ev.on('connection.update', handshakeHandler);
-        });
-    };
-    
     const requestPairingCode = async (socket, phoneNumber) => {
         console.log(`🔑 [${sessionId}] Requesting pairing code...`);
         
@@ -501,19 +508,19 @@ router.get('/', async (req, res) => {
         };
         currentSock.ev.on('creds.update', credsListener);
         
-        // Wait for stable connection
-        console.log(`⏳ [${sessionId}] Waiting for stable connection...`);
+        // Wait for registration to complete BEFORE requesting pairing code
+        console.log(`⏳ [${sessionId}] Waiting for WhatsApp registration...`);
         try {
-            await waitForStableConnection(currentSock);
-            console.log(`✅ [${sessionId}] Connection stable, ready for pairing`);
+            await waitForRegistrationComplete(currentSock, sessionId);
+            console.log(`✅ [${sessionId}] Registration complete, ready for pairing`);
         } catch (err) {
-            console.error(`❌ [${sessionId}] Connection failed:`, err.message);
+            console.error(`❌ [${sessionId}] Registration failed:`, err.message);
             sendResponse({
                 success: false,
-                error: `Connection failed: ${err.message}`,
+                error: `Registration failed: ${err.message}`,
                 sessionId
             });
-            cleanup(5000, 'connection_failed');
+            cleanup(5000, 'registration_failed');
             return;
         }
         
@@ -623,7 +630,7 @@ router.get('/', async (req, res) => {
         };
         currentSock.ev.on('connection.update', connectionListener);
         
-        // Request pairing code after connection is stable
+        // Request pairing code after registration is complete
         let pairingCode = null;
         try {
             pairingCode = await requestPairingCode(currentSock, formattedNumber);
