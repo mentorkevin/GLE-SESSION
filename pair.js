@@ -16,7 +16,7 @@ const MAX_CONCURRENT_PAIRINGS = parseInt(process.env.MAX_CONCURRENT_PAIRINGS) ||
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 100;
 const PAIRING_TIMEOUT = 120000;
 const PAIRING_CODE_TIMEOUT = 30000;
-const HANDSHAKE_TIMEOUT = 15000; // Time to wait for handshake completion
+const HANDSHAKE_TIMEOUT = 15000;
 const MAX_MESSAGE_SIZE = 8192;
 
 // Strict CORS
@@ -168,13 +168,35 @@ function redactNumber(number) {
     return number.substring(0, 2) + '****' + number.substring(len - 2);
 }
 
-function isDeviceLimitError(error) {
+function isRateLimitError(error) {
     const errorStr = error?.message?.toLowerCase() || '';
-    return errorStr.includes('device') || 
-           errorStr.includes('limit') || 
+    return errorStr.includes('qr refs') || 
+           errorStr.includes('attempts ended') ||
            errorStr.includes('too many') ||
-           errorStr.includes('max devices') ||
-           errorStr.includes('already linked');
+           errorStr.includes('rate') ||
+           errorStr.includes('408') ||
+           errorStr.includes('515');
+}
+
+async function forceCleanupNumber(phoneNumber, redactedNumber) {
+    if (ACTIVE_SESSIONS.has(phoneNumber)) {
+        const session = ACTIVE_SESSIONS.get(phoneNumber);
+        console.log(`🧹 Force cleaning session for ${redactedNumber}`);
+        
+        if (session.cleanupTimeout) clearTimeout(session.cleanupTimeout);
+        if (session.socket) {
+            try { session.socket.end(); } catch (e) {}
+        }
+        
+        // Clean up session directory
+        const sessionDir = path.join(TEMP_DIR, session.sessionId);
+        if (fs.existsSync(sessionDir)) {
+            setTimeout(() => removeFile(sessionDir, true), 1000);
+        }
+        
+        ACTIVE_SESSIONS.delete(phoneNumber);
+        activePairingCount = Math.max(0, activePairingCount - 1);
+    }
 }
 
 // Cleanup old session directories
@@ -310,7 +332,6 @@ router.get('/', async (req, res) => {
     let megaTimer = null;
     let cleanupTimer = null;
     let handshakeCompleted = false;
-    let handshakeResolver = null;
     
     // Register session
     ACTIVE_SESSIONS.set(formattedNumber, {
@@ -365,8 +386,13 @@ router.get('/', async (req, res) => {
     // Wait for WhatsApp handshake to complete
     const waitForHandshake = (socket, timeoutMs = HANDSHAKE_TIMEOUT) => {
         return new Promise((resolve, reject) => {
+            let resolved = false;
+            let connectionAttempts = 0;
+            
             const timeout = setTimeout(() => {
-                if (!handshakeCompleted) {
+                if (!resolved) {
+                    console.log(`⚠️ [${sessionId}] Handshake timeout after ${timeoutMs}ms`);
+                    if (handshakeHandler) socket.ev.off('connection.update', handshakeHandler);
                     reject(new Error('Handshake timeout - WhatsApp not responding'));
                 }
             }, timeoutMs);
@@ -374,20 +400,38 @@ router.get('/', async (req, res) => {
             const handshakeHandler = (update) => {
                 const { connection, lastDisconnect } = update;
                 
-                // Handshake is complete when we get "connecting" state or later
-                // This means WhatsApp has acknowledged the connection
-                if (connection === 'connecting' || connection === 'open') {
-                    handshakeCompleted = true;
+                if (connection === 'connecting') {
+                    connectionAttempts++;
+                    console.log(`[${sessionId}] Connection attempt ${connectionAttempts}`);
+                }
+                
+                if (connection === 'connecting' && !resolved) {
+                    resolved = true;
                     clearTimeout(timeout);
                     socket.ev.off('connection.update', handshakeHandler);
                     resolve();
                 }
                 
-                if (lastDisconnect?.error) {
-                    handshakeCompleted = true;
-                    clearTimeout(timeout);
-                    socket.ev.off('connection.update', handshakeHandler);
-                    reject(new Error(`Handshake error: ${lastDisconnect.error.message}`));
+                if (connection === 'close' && lastDisconnect?.error && !resolved) {
+                    const statusCode = lastDisconnect.error?.output?.statusCode;
+                    const errorMsg = lastDisconnect.error.message || '';
+                    
+                    if (statusCode === 408 || statusCode === 515 || errorMsg.includes('QR refs') || errorMsg.includes('attempts ended')) {
+                        resolved = true;
+                        clearTimeout(timeout);
+                        socket.ev.off('connection.update', handshakeHandler);
+                        reject(new Error('WhatsApp rejected connection - too many attempts or rate limited'));
+                    }
+                }
+                
+                if (lastDisconnect?.error && !resolved) {
+                    const errorMsg = lastDisconnect.error.message;
+                    if (errorMsg?.includes('QR refs') || errorMsg?.includes('attempts ended')) {
+                        resolved = true;
+                        clearTimeout(timeout);
+                        socket.ev.off('connection.update', handshakeHandler);
+                        reject(new Error('Too many pairing attempts. Please wait and try again.'));
+                    }
                 }
             };
             
@@ -395,7 +439,7 @@ router.get('/', async (req, res) => {
         });
     };
     
-    const requestPairingWithRetry = async (socket, phoneNumber, maxRetries = 3) => {
+    const requestPairingWithRetry = async (socket, phoneNumber, maxRetries = 2) => {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 console.log(`🔑 [${sessionId}] Requesting pairing code (attempt ${attempt}/${maxRetries})...`);
@@ -409,8 +453,18 @@ router.get('/', async (req, res) => {
                 
             } catch (err) {
                 console.error(`❌ [${sessionId}] Attempt ${attempt} failed:`, err.message);
+                
+                if (isRateLimitError(err)) {
+                    return { 
+                        success: false, 
+                        error: 'RATE_LIMIT_EXCEEDED',
+                        message: 'Too many pairing attempts. Please wait 5 minutes and try again.'
+                    };
+                }
+                
                 if (attempt < maxRetries) {
-                    await delay(2000);
+                    console.log(`🔄 [${sessionId}] Waiting 3 seconds before retry...`);
+                    await delay(3000);
                 }
             }
         }
@@ -464,6 +518,22 @@ router.get('/', async (req, res) => {
             console.log(`✅ [${sessionId}] Handshake complete, ready for pairing`);
         } catch (err) {
             console.error(`❌ [${sessionId}] Handshake failed:`, err.message);
+            
+            if (isRateLimitError(err)) {
+                await forceCleanupNumber(formattedNumber, redactedNumber);
+                
+                sendResponse({
+                    success: false,
+                    error: 'Too many pairing attempts. Please wait 5 minutes and try again.',
+                    sessionId,
+                    code: 'RATE_LIMIT_EXCEEDED',
+                    waitMinutes: 5,
+                    note: 'WhatsApp has temporarily blocked pairing for this number due to too many attempts.'
+                });
+                cleanup(5000, 'rate_limited');
+                return;
+            }
+            
             sendResponse({
                 success: false,
                 error: `WhatsApp handshake failed: ${err.message}`,
@@ -497,14 +567,12 @@ router.get('/', async (req, res) => {
                     if (phoneMatches) {
                         userConnected = true;
                         
-                        // Update session state
                         if (ACTIVE_SESSIONS.has(formattedNumber)) {
                             ACTIVE_SESSIONS.get(formattedNumber).state = 'connected';
                         }
                         
                         await delay(2000);
                         
-                        // Wait for creds file
                         let credsWait = 0;
                         while (!fs.existsSync(path.join(sessionDir, 'creds.json')) && credsWait < 30) {
                             await delay(500);
@@ -547,7 +615,6 @@ router.get('/', async (req, res) => {
                             console.log(`✅ [${sessionId}] Session exported`);
                             sessionExported = true;
                             
-                            // Mega backup
                             if (!megaUploadStarted) {
                                 megaUploadStarted = true;
                                 megaTimer = setTimeout(async () => {
@@ -578,17 +645,25 @@ router.get('/', async (req, res) => {
         };
         currentSock.ev.on('connection.update', connectionListener);
         
-        // NOW request pairing code (after handshake is complete)
+        // Request pairing code after handshake is complete
         const pairingResult = await requestPairingWithRetry(currentSock, formattedNumber);
         
         if (!pairingResult.success) {
-            const isDeviceLimit = isDeviceLimitError(pairingResult.error);
-            sendResponse({
-                success: false,
-                error: isDeviceLimit ? 'Too many linked devices. Please remove one from WhatsApp settings.' : `Pairing failed: ${pairingResult.error}`,
-                sessionId,
-                code: isDeviceLimit ? 'DEVICE_LIMIT' : 'PAIRING_FAILED'
-            });
+            if (pairingResult.error === 'RATE_LIMIT_EXCEEDED') {
+                await forceCleanupNumber(formattedNumber, redactedNumber);
+                sendResponse({
+                    success: false,
+                    error: pairingResult.message || 'Too many pairing attempts. Please wait 5 minutes and try again.',
+                    sessionId,
+                    code: 'RATE_LIMIT_EXCEEDED'
+                });
+            } else {
+                sendResponse({
+                    success: false,
+                    error: `Pairing failed: ${pairingResult.error}`,
+                    sessionId
+                });
+            }
             cleanup(5000, 'pairing_failed');
             return;
         }
@@ -612,7 +687,6 @@ router.get('/', async (req, res) => {
             expiresIn: Math.floor(PAIRING_TIMEOUT / 1000)
         });
         
-        // Final timeout
         cleanupTimer = setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Timeout waiting for connection`);
@@ -629,7 +703,18 @@ router.get('/', async (req, res) => {
         
     } catch (error) {
         console.error(`❌ [${sessionId}] Fatal:`, error);
-        if (!responseSent && !cleaned) {
+        
+        if (isRateLimitError(error)) {
+            await forceCleanupNumber(formattedNumber, redactedNumber);
+            if (!responseSent && !cleaned) {
+                sendResponse({ 
+                    success: false, 
+                    error: 'Too many pairing attempts. Please wait 5 minutes and try again.',
+                    sessionId,
+                    code: 'RATE_LIMIT_EXCEEDED'
+                });
+            }
+        } else if (!responseSent && !cleaned) {
             sendResponse({ success: false, error: error.message, sessionId });
         }
         cleanup(5000, 'fatal');
@@ -659,5 +744,20 @@ router.get('/status', (req, res) => {
         availableSlots: Math.max(0, MAX_CONCURRENT_PAIRINGS - activePairingCount)
     });
 });
+
+// Clean up any stale sessions on server start
+setTimeout(async () => {
+    console.log('🧹 Cleaning up stale sessions on startup...');
+    const files = fs.existsSync(TEMP_DIR) ? fs.readdirSync(TEMP_DIR) : [];
+    for (const file of files) {
+        const filePath = path.join(TEMP_DIR, file);
+        try {
+            const stat = fs.statSync(filePath);
+            if (Date.now() - stat.mtimeMs > PAIRING_TIMEOUT) {
+                removeFile(filePath, true);
+            }
+        } catch (e) {}
+    }
+}, 5000);
 
 export default router;
