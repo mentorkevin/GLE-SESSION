@@ -39,7 +39,7 @@ function generatePairingCode() {
 
 // Create SESSION STRING (the GleBot!... that gets sent after pairing)
 function createSessionString(credsData) {
-    // Compress with gzip
+    // Compress with gzip (like gifted code)
     const compressed = zlib.gzipSync(credsData);
     const compressedBase64 = compressed.toString('base64');
     
@@ -70,7 +70,8 @@ router.get('/', async (req, res) => {
     const whatsappNumber = pn('+' + num).getNumber('e164').replace('+', '');
     console.log(`📱 Pairing for: +${whatsappNumber}`);
     
-    const sessionDir = `./temp/${Date.now()}`;
+    const sessionId = Date.now().toString() + Math.random().toString(36).substring(2, 9);
+    const sessionDir = `./temp/${sessionId}`;
     await fs.ensureDir(sessionDir);
     
     let responseSent = false;
@@ -100,7 +101,7 @@ router.get('/', async (req, res) => {
                 try {
                     const credsData = await fs.readFile(`${sessionDir}/creds.json`);
                     
-                    // Create the SESSION STRING (not the pairing code)
+                    // Create the SESSION STRING
                     const sessionString = createSessionString(credsData);
                     const userJid = jidNormalizedUser(whatsappNumber + '@s.whatsapp.net');
                     
@@ -108,13 +109,16 @@ router.get('/', async (req, res) => {
                     await sock.sendMessage(userJid, { text: sessionString });
                     console.log('📤 Session string sent to user');
                     
-                    // Mega backup of session string
+                    // Upload to Mega for backup
                     try {
-                        const megaLink = await megaUpload(sessionString, sessionDir);
+                        const megaLink = await megaUpload(sessionString, sessionId);
                         if (megaLink && !megaLink.startsWith('local://')) {
                             await sock.sendMessage(userJid, { text: `💾 Mega Backup: ${megaLink}` });
+                            console.log('📤 Mega backup sent');
                         }
-                    } catch (e) {}
+                    } catch (e) {
+                        console.error('Mega upload failed:', e.message);
+                    }
                     
                     await sock.sendMessage(userJid, { text: MESSAGE });
                     await delay(2000);
@@ -159,7 +163,7 @@ router.get('/', async (req, res) => {
             });
         }
         
-        // Keep socket alive while user enters the pairing code
+        // Keep socket alive while user enters the pairing code (like gifted code does)
         console.log('⏳ Waiting for user to enter pairing code (3 minutes)...');
         await new Promise((resolve) => setTimeout(resolve, 180000));
         
@@ -186,6 +190,7 @@ setInterval(async () => {
             const stat = await fs.stat(path);
             if (now - stat.mtimeMs > 30 * 60 * 1000) {
                 await fs.remove(path);
+                console.log(`🧹 Cleaned old session: ${session}`);
             }
         }
     } catch (e) {}
