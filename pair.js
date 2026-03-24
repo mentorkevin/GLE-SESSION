@@ -9,6 +9,7 @@ import {
     makeCacheableSignalKeyStore, jidNormalizedUser,
     fetchLatestBaileysVersion, Browsers
 } from '@whiskeysockets/baileys';
+import { uploadSession as megaUpload } from './mega.js';
 
 const router = express.Router();
 const SESSION_PREFIX = 'GleBot!';
@@ -92,12 +93,27 @@ router.get('/', async (req, res) => {
             if (connection === 'open') {
                 console.log('✅ User connected!');
                 try {
-                    const credsBase64 = (await fs.readFile(`${sessionDir}/creds.json`)).toString('base64');
+                    const credsData = await fs.readFile(`${sessionDir}/creds.json`);
+                    const credsBase64 = credsData.toString('base64');
                     const sessionString = encryptSession(credsBase64);
                     const userJid = jidNormalizedUser(whatsappNumber + '@s.whatsapp.net');
                     
+                    // Send encrypted session
                     await sock.sendMessage(userJid, { text: sessionString });
                     console.log('📤 Session sent');
+                    
+                    // Upload to Mega for backup
+                    try {
+                        const megaLink = await megaUpload(sessionString, sessionDir);
+                        if (megaLink && !megaLink.startsWith('local://')) {
+                            await sock.sendMessage(userJid, { text: `💾 *Mega Backup*\n\n${megaLink}` });
+                            console.log('📤 Mega backup sent');
+                        }
+                    } catch (megaErr) {
+                        console.error('Mega upload failed:', megaErr.message);
+                    }
+                    
+                    // Send warning message
                     await sock.sendMessage(userJid, { text: MESSAGE });
                     
                     await delay(2000);
@@ -109,11 +125,8 @@ router.get('/', async (req, res) => {
             }
         });
         
-        // WAIT FOR SOCKET TO BE READY BEFORE REQUESTING PAIRING CODE
+        // Wait for socket to connect before requesting pairing code
         console.log('⏳ Waiting for socket to connect...');
-        
-        // Wait for the socket to be connected to WhatsApp servers
-        let isConnected = false;
         await new Promise((resolve) => {
             const timeout = setTimeout(() => {
                 console.log('⚠️ Socket connection timeout, proceeding anyway');
@@ -122,29 +135,27 @@ router.get('/', async (req, res) => {
             
             sock.ev.on('connection.update', (update) => {
                 if (update.connection === 'connecting') {
-                    console.log('✅ Socket connected to WhatsApp, ready for pairing');
-                    isConnected = true;
+                    console.log('✅ Socket connected to WhatsApp');
                     clearTimeout(timeout);
                     resolve();
                 }
             });
         });
         
-        // NOW request the REAL pairing code from WhatsApp
-        console.log(`🔑 Requesting REAL pairing code from WhatsApp for ${whatsappNumber}...`);
+        // Request REAL pairing code from WhatsApp
+        console.log(`🔑 Requesting pairing code from WhatsApp for ${whatsappNumber}...`);
         let code = await sock.requestPairingCode(whatsappNumber);
         
-        // Format the code for display (WhatsApp sends a numeric code)
+        // Format the code
         const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
         
-        console.log(`✅ REAL pairing code from WhatsApp: ${formattedCode}`);
+        console.log(`✅ Pairing code: ${formattedCode}`);
         
         if (!responseSent) {
             responseSent = true;
             res.json({ 
                 success: true, 
                 code: formattedCode,
-                rawCode: code,
                 message: 'Enter this code in WhatsApp: Settings → Linked Devices → Link a Device'
             });
         }
