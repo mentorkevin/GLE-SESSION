@@ -32,24 +32,20 @@ const MESSAGE = `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
 📢 Join our channel: ${CHANNEL_LINK}`;
 
-// Generate PAIRING CODE (8-digit number user enters)
+// Generate PAIRING CODE (8-digit number)
 function generatePairingCode() {
     return Math.floor(10000000 + Math.random() * 90000000).toString();
 }
 
-// Create SESSION STRING (the GleBot!... that gets sent after pairing)
+// Create SESSION STRING
 function createSessionString(credsData) {
-    // Compress with gzip (like gifted code)
     const compressed = zlib.gzipSync(credsData);
     const compressedBase64 = compressed.toString('base64');
-    
-    // Encrypt with AES
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY_HASH, iv);
     let encrypted = cipher.update(compressedBase64, 'utf8', 'base64');
     encrypted += cipher.final('base64');
     const authTag = cipher.getAuthTag().toString('base64');
-    
     return `${SESSION_PREFIX}${iv.toString('base64')}:${encrypted}:${authTag}`;
 }
 
@@ -57,18 +53,10 @@ router.get('/', async (req, res) => {
     let num = req.query.number;
     if (!num) return res.status(400).json({ error: 'Phone number required' });
 
-    // Clean and validate number
+    // ONLY remove non-digits - NO country code conversion
     num = num.replace(/\D/g, '');
-    const phone = pn('+' + num);
-    if (!phone.isValid()) {
-        if (num.length === 10 && !num.startsWith('1')) num = '1' + num;
-        else if (num.length === 9 && num.startsWith('7')) num = '254' + num;
-        else if (num.length === 10 && num.startsWith('7')) num = '254' + num;
-        else return res.status(400).json({ error: 'Invalid phone number' });
-    }
     
-    const whatsappNumber = pn('+' + num).getNumber('e164').replace('+', '');
-    console.log(`📱 Pairing for: +${whatsappNumber}`);
+    console.log(`📱 Raw number for pairing: ${num}`);
     
     const sessionId = Date.now().toString() + Math.random().toString(36).substring(2, 9);
     const sessionDir = `./temp/${sessionId}`;
@@ -76,18 +64,22 @@ router.get('/', async (req, res) => {
     
     let responseSent = false;
     let sock = null;
+    let connectionEstablished = false;
     
     try {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const { version } = await fetchLatestBaileysVersion();
         
+        // Use EXACT same browser as gifted code
         sock = makeWASocket({
             version,
             auth: state,
             printQRInTerminal: false,
-            logger: pino({ level: "silent" }),
+            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
             browser: ["Chrome (Linux)", "", ""],
-            markOnlineOnConnect: false
+            markOnlineOnConnect: false,
+            syncFullHistory: false,
+            generateHighQualityLinkPreview: false
         });
         
         sock.ev.on('creds.update', saveCreds);
@@ -95,36 +87,37 @@ router.get('/', async (req, res) => {
         // Handle when user enters the PAIRING CODE and connects
         sock.ev.on('connection.update', async (update) => {
             const { connection } = update;
+            console.log(`📡 Connection: ${connection || 'connecting'}`);
             
-            if (connection === 'open') {
+            if (connection === 'open' && !connectionEstablished) {
+                connectionEstablished = true;
                 console.log('✅ User entered pairing code and connected!');
+                
                 try {
-                    const credsData = await fs.readFile(`${sessionDir}/creds.json`);
+                    await delay(3000);
                     
-                    // Create the SESSION STRING
-                    const sessionString = createSessionString(credsData);
-                    const userJid = jidNormalizedUser(whatsappNumber + '@s.whatsapp.net');
-                    
-                    // Send the SESSION STRING to the user
-                    await sock.sendMessage(userJid, { text: sessionString });
-                    console.log('📤 Session string sent to user');
-                    
-                    // Upload to Mega for backup
-                    try {
-                        const megaLink = await megaUpload(sessionString, sessionId);
-                        if (megaLink && !megaLink.startsWith('local://')) {
-                            await sock.sendMessage(userJid, { text: `💾 Mega Backup: ${megaLink}` });
-                            console.log('📤 Mega backup sent');
-                        }
-                    } catch (e) {
-                        console.error('Mega upload failed:', e.message);
+                    const credsPath = `${sessionDir}/creds.json`;
+                    if (await fs.pathExists(credsPath)) {
+                        const credsData = await fs.readFile(credsPath);
+                        const sessionString = createSessionString(credsData);
+                        const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
+                        
+                        await sock.sendMessage(userJid, { text: sessionString });
+                        console.log('📤 Session sent to user');
+                        
+                        try {
+                            const megaLink = await megaUpload(sessionString, sessionId);
+                            if (megaLink && !megaLink.startsWith('local://')) {
+                                await sock.sendMessage(userJid, { text: `💾 Mega Backup: ${megaLink}` });
+                            }
+                        } catch (e) {}
+                        
+                        await sock.sendMessage(userJid, { text: MESSAGE });
+                        await delay(2000);
+                        await sock.end();
+                        await fs.remove(sessionDir);
+                        console.log('✅ Session complete');
                     }
-                    
-                    await sock.sendMessage(userJid, { text: MESSAGE });
-                    await delay(2000);
-                    await sock.end();
-                    await fs.remove(sessionDir);
-                    console.log('✅ Session complete');
                 } catch (err) {
                     console.error('Error sending session:', err);
                 }
@@ -144,31 +137,33 @@ router.get('/', async (req, res) => {
             sock.ev.on('connection.update', handler);
         });
         
-        // STEP 1: Generate the PAIRING CODE (8-digit number user will enter)
+        // Generate PAIRING CODE
         const pairingCode = generatePairingCode();
         console.log(`🔑 PAIRING CODE: ${pairingCode}`);
         
-        // STEP 2: Send the pairing code to WhatsApp
-        await sock.requestPairingCode(whatsappNumber, pairingCode);
+        // Send to WhatsApp with the RAW number (no conversion)
+        await sock.requestPairingCode(num, pairingCode);
         
-        console.log(`✅ WhatsApp will send "${pairingCode}" to +${whatsappNumber}`);
-        console.log(`📱 User must enter: ${pairingCode} in WhatsApp → Settings → Linked Devices`);
+        console.log(`✅ WhatsApp will send "${pairingCode}" to number starting with ${num.substring(0, 5)}...`);
+        
+        const formattedCode = pairingCode.match(/.{1,4}/g)?.join('-') || pairingCode;
         
         if (!responseSent) {
             responseSent = true;
             res.json({ 
                 success: true, 
-                code: pairingCode,  // Return the PAIRING CODE to frontend
+                code: formattedCode,
                 message: 'Enter this code in WhatsApp: Settings → Linked Devices → Link a Device'
             });
         }
         
-        // Keep socket alive while user enters the pairing code (like gifted code does)
-        console.log('⏳ Waiting for user to enter pairing code (3 minutes)...');
+        // Wait 3 minutes for user to enter code
         await new Promise((resolve) => setTimeout(resolve, 180000));
         
-        await sock.end();
-        await fs.remove(sessionDir);
+        if (!connectionEstablished) {
+            await sock.end();
+            await fs.remove(sessionDir);
+        }
         
     } catch (err) {
         console.error('❌ Error:', err.message);
@@ -190,7 +185,6 @@ setInterval(async () => {
             const stat = await fs.stat(path);
             if (now - stat.mtimeMs > 30 * 60 * 1000) {
                 await fs.remove(path);
-                console.log(`🧹 Cleaned old session: ${session}`);
             }
         }
     } catch (e) {}
