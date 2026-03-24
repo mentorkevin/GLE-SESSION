@@ -2,7 +2,6 @@ import express from 'express';
 import fs from 'fs';
 import { makeWASocket, useMultiFileAuthState, delay, Browsers, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import pn from 'awesome-phonenumber';
-import { uploadSession } from './mega.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
@@ -39,7 +38,7 @@ function getCredsFile(sessionDir) {
         if (!fs.existsSync(credsPath)) return null;
         return fs.readFileSync(credsPath).toString('base64');
     } catch (err) {
-        console.error(`Failed to read creds.json:`, err);
+        console.error('Failed to read creds.json:', err);
         return null;
     }
 }
@@ -47,7 +46,7 @@ function getCredsFile(sessionDir) {
 function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
     if (!ENCRYPTION_KEY) {
-        if (!encryptionWarningLogged) { console.warn(`⚠️ Encryption disabled!`); encryptionWarningLogged = true; }
+        if (!encryptionWarningLogged) { console.warn('⚠️ Encryption disabled!'); encryptionWarningLogged = true; }
         return `GleBot!${zlib.deflateSync(credsBase64).toString('base64')}`;
     }
     const compressed = zlib.deflateSync(credsBase64);
@@ -58,13 +57,6 @@ function encryptSession(credsBase64, sessionId) {
     let encrypted = cipher.update(dataToEncrypt, 'utf8', 'base64');
     encrypted += cipher.final('base64');
     return `GleBot!${iv.toString('base64')}:${encrypted}:${cipher.getAuthTag().toString('base64')}`;
-}
-
-// ✅ FIX 1: Always fetch fresh version, no stale fallback
-async function getWAVersion() {
-    const { version } = await fetchLatestBaileysVersion();
-    console.log(`📦 WA Version: ${version}`);
-    return version;
 }
 
 function checkRateLimit(ip) {
@@ -81,8 +73,7 @@ setInterval(() => {
     try {
         if (!fs.existsSync(TEMP_DIR)) return;
         const now = Date.now();
-        const files = fs.readdirSync(TEMP_DIR);
-        for (const file of files) {
+        for (const file of fs.readdirSync(TEMP_DIR)) {
             const fp = path.join(TEMP_DIR, file);
             try { if (now - fs.statSync(fp).mtimeMs > CLEANUP_AGE) removeFile(fp); } catch (e) {}
         }
@@ -126,18 +117,17 @@ router.get('/', async (req, res) => {
     let sessionExported = false;
     let userConnected = false;
     let cleaned = false;
-    let reconnectTimer = null;
-    let version = null;
+    let codeTimeout = null;
+    let overallTimeout = null;
     let formattedNumber = null;
-    let authState = null;
     let saveCredsFn = null;
 
-    // ✅ FIX 2: Proper cleanup using ws.close()
     const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
         console.log(`🧹 [${sessionId}] Cleanup`);
-        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (codeTimeout) clearTimeout(codeTimeout);
+        if (overallTimeout) clearTimeout(overallTimeout);
         if (sock) {
             sock.ev.removeAllListeners();
             try { sock.ws?.close(); } catch (e) {}
@@ -146,14 +136,13 @@ router.get('/', async (req, res) => {
         setTimeout(() => removeFile(sessionDir), 5000);
     };
 
-    // ✅ Shared open handler — always uses current `sock` via closure
     const handleOpen = async () => {
         if (userConnected) return;
         userConnected = true;
         console.log(`🎉 [${sessionId}] USER CONNECTED! ${sock.user?.id}`);
-        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (codeTimeout) clearTimeout(codeTimeout);
 
-        await delay(5000);
+        await delay(3000);
         try {
             const credsBase64 = getCredsFile(sessionDir);
             if (!credsBase64) throw new Error('creds.json not found');
@@ -188,77 +177,6 @@ router.get('/', async (req, res) => {
         }
     };
 
-    // ✅ Attach events — sock always read from closure, never captured in callback
-    const attachEvents = () => {
-        sock.ev.on('creds.update', () => {
-            if (saveCredsFn) saveCredsFn();
-        });
-
-        sock.ev.on('connection.update', async (update) => {
-            if (sessionExported || cleaned) return;
-
-            const { connection, lastDisconnect } = update;
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            console.log(`[${sessionId}] State: ${connection || 'waiting'} ${statusCode ? `(${statusCode})` : ''}`);
-
-            // ✅ 515: Baileys doesn't auto-reconnect — must recreate socket
-            if (connection === 'close' && statusCode === 515 && codeSent && !userConnected) {
-                console.log(`🔄 [${sessionId}] 515 - recreating socket...`);
-                if (reconnectTimer) clearTimeout(reconnectTimer);
-
-                setTimeout(async () => {
-                    if (userConnected || sessionExported || cleaned) return;
-
-                    // Reload auth state from disk (updated after code)
-                    const { state: newState, saveCreds: newSaveCreds } = await useMultiFileAuthState(sessionDir);
-                    authState = newState;
-                    saveCredsFn = newSaveCreds;
-
-                    const old = sock;
-                    // ✅ FIX 3: macOS Safari fingerprint — less likely to be flagged
-                    sock = makeWASocket({
-                        version,
-                        auth: authState,
-                        printQRInTerminal: false,
-                        browser: Browsers.macOS("Safari"),
-                        syncFullHistory: false,
-                        markOnlineOnConnect: true,
-                        keepAliveIntervalMs: 30000,
-                        defaultQueryTimeoutMs: 60000,
-                        connectTimeoutMs: 60000,
-                        generateHighQualityLinkPreview: false,
-                        retryRequestDelayMs: 250
-                    });
-
-                    old.ev.removeAllListeners();
-                    try { old.ws?.close(); } catch (e) {}
-                    try { old.end(new Error('replaced')); } catch (e) {}
-
-                    attachEvents();
-                    console.log(`✅ [${sessionId}] Socket recreated after 515`);
-
-                    reconnectTimer = setTimeout(() => {
-                        if (!userConnected && !sessionExported && !cleaned) {
-                            console.log(`⏰ [${sessionId}] User didn't connect after 515`);
-                            cleanup();
-                        }
-                    }, 120000);
-                }, 2000);
-                return;
-            }
-
-            if (connection === 'open' && sock.user && !userConnected) {
-                await handleOpen();
-            }
-
-            if (connection === 'close' && !codeSent && !sessionExported && !userConnected) {
-                console.log(`🔴 [${sessionId}] Closed before code sent (${statusCode})`);
-                if (!res.headersSent) res.status(500).json({ success: false, error: `Connection closed (${statusCode})` });
-                cleanup();
-            }
-        });
-    };
-
     try {
         if (!number) return res.status(400).json({ success: false, error: 'Phone number required' });
 
@@ -270,30 +188,61 @@ router.get('/', async (req, res) => {
         fs.mkdirSync(sessionDir, { recursive: true });
 
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        authState = state;
         saveCredsFn = saveCreds;
 
-        // ✅ FIX 1: Fresh version — throws if fetch fails (no stale fallback)
-        version = await getWAVersion();
+        const { version } = await fetchLatestBaileysVersion();
+        console.log(`📦 WA Version: ${version}`);
 
-        // ✅ FIX 3: macOS Safari on initial socket too
+        // ✅ KEY FIX: getMessage required for pairing to complete + macOS Safari browser
         sock = makeWASocket({
             version,
-            auth: authState,
+            auth: state,
             printQRInTerminal: false,
             browser: Browsers.macOS("Safari"),
             syncFullHistory: false,
-            markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000,
+            markOnlineOnConnect: false,
+            keepAliveIntervalMs: 10000,
             defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000,
             generateHighQualityLinkPreview: false,
-            retryRequestDelayMs: 250
+            getMessage: async () => ({ conversation: '' })
         });
 
-        attachEvents();
+        sock.ev.on('creds.update', () => {
+            if (saveCredsFn) saveCredsFn();
+        });
 
-        // Request pairing code after 3s
+        sock.ev.on('connection.update', async (update) => {
+            if (sessionExported || cleaned) return;
+
+            const { connection, lastDisconnect } = update;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            console.log(`[${sessionId}] State: ${connection || 'waiting'} ${statusCode ? `(${statusCode})` : ''}`);
+
+            // ✅ KEY FIX: 515 = WhatsApp restarting after code entry — DO NOTHING
+            // Baileys auto-reconnects internally. Do NOT recreate socket.
+            if (connection === 'close' && statusCode === 515) {
+                console.log(`🔄 [${sessionId}] 515 restart — waiting for user to complete linking...`);
+                return;
+            }
+
+            // ✅ User successfully linked device
+            if (connection === 'open' && sock.user && !userConnected) {
+                await handleOpen();
+                return;
+            }
+
+            // Fatal close (not 515) — give up
+            if (connection === 'close' && statusCode !== 515 && !userConnected && !sessionExported) {
+                console.log(`🔴 [${sessionId}] Fatal close (${statusCode})`);
+                if (!codeSent && !res.headersSent) {
+                    res.status(500).json({ success: false, error: `Connection failed (${statusCode})` });
+                }
+                cleanup();
+            }
+        });
+
+        // ✅ Request pairing code after socket is ready
         setTimeout(async () => {
             if (codeSent || sessionExported || cleaned) return;
             try {
@@ -318,6 +267,15 @@ router.get('/', async (req, res) => {
                         ]
                     });
                 }
+
+                // Timeout if user never enters code
+                codeTimeout = setTimeout(() => {
+                    if (!userConnected && !sessionExported && !cleaned) {
+                        console.log(`⏰ [${sessionId}] Code entry timeout`);
+                        cleanup();
+                    }
+                }, 180000);
+
             } catch (err) {
                 console.error(`Code error:`, err);
                 if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
@@ -333,13 +291,13 @@ router.get('/', async (req, res) => {
             }
         }, 30000);
 
-        // Overall timeout
-        setTimeout(() => {
+        // Overall session timeout
+        overallTimeout = setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Overall timeout`);
                 cleanup();
             }
-        }, 180000);
+        }, 300000);
 
     } catch (error) {
         console.error(`Fatal:`, error);
