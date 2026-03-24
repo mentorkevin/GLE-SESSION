@@ -23,14 +23,12 @@ if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const MAX_SESSIONS = 100;
 const CLEANUP_AGE = 3600000;
-let cachedVersion = null;
-let versionCacheTime = 0;
-const VERSION_CACHE_TTL = 3600000;
 let encryptionWarningLogged = false;
 const rateLimits = new Map();
 const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
 
 function makeid() { return crypto.randomBytes(8).toString('hex'); }
+
 function removeFile(filePath) {
     try { if (fs.existsSync(filePath)) fs.rmSync(filePath, { recursive: true, force: true }); } catch (e) {}
 }
@@ -50,8 +48,7 @@ function encryptSession(credsBase64, sessionId) {
     const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
     if (!ENCRYPTION_KEY) {
         if (!encryptionWarningLogged) { console.warn(`⚠️ Encryption disabled!`); encryptionWarningLogged = true; }
-        const compressed = zlib.deflateSync(credsBase64);
-        return `GleBot!${compressed.toString('base64')}`;
+        return `GleBot!${zlib.deflateSync(credsBase64).toString('base64')}`;
     }
     const compressed = zlib.deflateSync(credsBase64);
     const dataToEncrypt = JSON.stringify({ sessionId, creds: compressed.toString('base64') });
@@ -60,21 +57,14 @@ function encryptSession(credsBase64, sessionId) {
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     let encrypted = cipher.update(dataToEncrypt, 'utf8', 'base64');
     encrypted += cipher.final('base64');
-    const authTag = cipher.getAuthTag().toString('base64');
-    return `GleBot!${iv.toString('base64')}:${encrypted}:${authTag}`;
+    return `GleBot!${iv.toString('base64')}:${encrypted}:${cipher.getAuthTag().toString('base64')}`;
 }
 
-async function getCachedVersion() {
-    try {
-        const now = Date.now();
-        if (cachedVersion && (now - versionCacheTime) < VERSION_CACHE_TTL) return cachedVersion;
-        const { version } = await fetchLatestBaileysVersion();
-        cachedVersion = version;
-        versionCacheTime = now;
-        return version;
-    } catch (err) {
-        return cachedVersion || [2, 3000, 1035194821];
-    }
+// ✅ FIX 1: Always fetch fresh version, no stale fallback
+async function getWAVersion() {
+    const { version } = await fetchLatestBaileysVersion();
+    console.log(`📦 WA Version: ${version}`);
+    return version;
 }
 
 function checkRateLimit(ip) {
@@ -93,18 +83,18 @@ setInterval(() => {
         const now = Date.now();
         const files = fs.readdirSync(TEMP_DIR);
         for (const file of files) {
-            const filePath = path.join(TEMP_DIR, file);
-            try {
-                if (now - fs.statSync(filePath).mtimeMs > CLEANUP_AGE) removeFile(filePath);
-            } catch (e) {}
+            const fp = path.join(TEMP_DIR, file);
+            try { if (now - fs.statSync(fp).mtimeMs > CLEANUP_AGE) removeFile(fp); } catch (e) {}
         }
         const sessions = fs.readdirSync(TEMP_DIR);
         if (sessions.length > MAX_SESSIONS) {
-            sessions.sort((a, b) => {
-                try { return fs.statSync(path.join(TEMP_DIR, a)).mtimeMs - fs.statSync(path.join(TEMP_DIR, b)).mtimeMs; }
-                catch (e) { return 0; }
-            });
-            sessions.slice(0, sessions.length - MAX_SESSIONS).forEach(s => removeFile(path.join(TEMP_DIR, s)));
+            sessions
+                .sort((a, b) => {
+                    try { return fs.statSync(path.join(TEMP_DIR, a)).mtimeMs - fs.statSync(path.join(TEMP_DIR, b)).mtimeMs; }
+                    catch (e) { return 0; }
+                })
+                .slice(0, sessions.length - MAX_SESSIONS)
+                .forEach(s => removeFile(path.join(TEMP_DIR, s)));
         }
     } catch (e) {}
 }, 600000);
@@ -142,6 +132,7 @@ router.get('/', async (req, res) => {
     let authState = null;
     let saveCredsFn = null;
 
+    // ✅ FIX 2: Proper cleanup using ws.close()
     const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
@@ -149,16 +140,17 @@ router.get('/', async (req, res) => {
         if (reconnectTimer) clearTimeout(reconnectTimer);
         if (sock) {
             sock.ev.removeAllListeners();
-            try { sock.end(); } catch (e) {}
+            try { sock.ws?.close(); } catch (e) {}
+            try { sock.end(new Error('cleanup')); } catch (e) {}
         }
         setTimeout(() => removeFile(sessionDir), 5000);
     };
 
-    // ✅ Shared open handler - always uses current `sock` via closure
+    // ✅ Shared open handler — always uses current `sock` via closure
     const handleOpen = async () => {
         if (userConnected) return;
         userConnected = true;
-        console.log(`🎉 [${sessionId}] USER CONNECTED! User: ${sock.user?.id}`);
+        console.log(`🎉 [${sessionId}] USER CONNECTED! ${sock.user?.id}`);
         if (reconnectTimer) clearTimeout(reconnectTimer);
 
         await delay(5000);
@@ -189,17 +181,6 @@ router.get('/', async (req, res) => {
 
             console.log(`✅ [${sessionId}] Session sent`);
             sessionExported = true;
-
-            // Background Mega upload
-            (async () => {
-                try {
-                    const megaUrl = await uploadSession(sessionString, sessionId);
-                    if (megaUrl && !megaUrl.startsWith('local://') && sock?.user) {
-                        await sock.sendMessage(userJid, { text: `💾 *Mega Backup*\n\n${megaUrl}` });
-                    }
-                } catch (e) {}
-            })();
-
             setTimeout(() => cleanup(), 30000);
         } catch (err) {
             console.error(`❌ [${sessionId}] Export failed:`, err);
@@ -207,7 +188,7 @@ router.get('/', async (req, res) => {
         }
     };
 
-    // ✅ Attach events - always uses `sock` from outer closure (NOT newSock)
+    // ✅ Attach events — sock always read from closure, never captured in callback
     const attachEvents = () => {
         sock.ev.on('creds.update', () => {
             if (saveCredsFn) saveCredsFn();
@@ -220,7 +201,7 @@ router.get('/', async (req, res) => {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             console.log(`[${sessionId}] State: ${connection || 'waiting'} ${statusCode ? `(${statusCode})` : ''}`);
 
-            // 515: WhatsApp restarts connection after code - recreate socket
+            // ✅ 515: Baileys doesn't auto-reconnect — must recreate socket
             if (connection === 'close' && statusCode === 515 && codeSent && !userConnected) {
                 console.log(`🔄 [${sessionId}] 515 - recreating socket...`);
                 if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -228,35 +209,37 @@ router.get('/', async (req, res) => {
                 setTimeout(async () => {
                     if (userConnected || sessionExported || cleaned) return;
 
-                    // Reload fresh auth state from disk
+                    // Reload auth state from disk (updated after code)
                     const { state: newState, saveCreds: newSaveCreds } = await useMultiFileAuthState(sessionDir);
                     authState = newState;
                     saveCredsFn = newSaveCreds;
 
-                    // Replace sock reference BEFORE attaching events
                     const old = sock;
+                    // ✅ FIX 3: macOS Safari fingerprint — less likely to be flagged
                     sock = makeWASocket({
                         version,
                         auth: authState,
                         printQRInTerminal: false,
-                        browser: Browsers.ubuntu("Chrome"),
+                        browser: Browsers.macOS("Safari"),
                         syncFullHistory: false,
                         markOnlineOnConnect: true,
                         keepAliveIntervalMs: 30000,
                         defaultQueryTimeoutMs: 60000,
-                        connectTimeoutMs: 60000
+                        connectTimeoutMs: 60000,
+                        generateHighQualityLinkPreview: false,
+                        retryRequestDelayMs: 250
                     });
 
-                    // Clean up old socket AFTER new one is assigned
                     old.ev.removeAllListeners();
-                    try { old.end(); } catch (e) {}
+                    try { old.ws?.close(); } catch (e) {}
+                    try { old.end(new Error('replaced')); } catch (e) {}
 
-                    attachEvents(); // ✅ new events on new sock, uses `sock` closure
+                    attachEvents();
                     console.log(`✅ [${sessionId}] Socket recreated after 515`);
 
                     reconnectTimer = setTimeout(() => {
                         if (!userConnected && !sessionExported && !cleaned) {
-                            console.log(`⏰ [${sessionId}] User didn't connect`);
+                            console.log(`⏰ [${sessionId}] User didn't connect after 515`);
                             cleanup();
                         }
                     }, 120000);
@@ -264,14 +247,13 @@ router.get('/', async (req, res) => {
                 return;
             }
 
-            // User entered code - connected!
             if (connection === 'open' && sock.user && !userConnected) {
                 await handleOpen();
             }
 
-            // Unexpected close before code was sent
             if (connection === 'close' && !codeSent && !sessionExported && !userConnected) {
-                console.log(`🔴 [${sessionId}] Closed before code sent`);
+                console.log(`🔴 [${sessionId}] Closed before code sent (${statusCode})`);
+                if (!res.headersSent) res.status(500).json({ success: false, error: `Connection closed (${statusCode})` });
                 cleanup();
             }
         });
@@ -290,23 +272,28 @@ router.get('/', async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         authState = state;
         saveCredsFn = saveCreds;
-        version = await getCachedVersion();
 
+        // ✅ FIX 1: Fresh version — throws if fetch fails (no stale fallback)
+        version = await getWAVersion();
+
+        // ✅ FIX 3: macOS Safari on initial socket too
         sock = makeWASocket({
             version,
             auth: authState,
             printQRInTerminal: false,
-            browser: Browsers.ubuntu("Chrome"),
+            browser: Browsers.macOS("Safari"),
             syncFullHistory: false,
             markOnlineOnConnect: true,
             keepAliveIntervalMs: 30000,
             defaultQueryTimeoutMs: 60000,
-            connectTimeoutMs: 60000
+            connectTimeoutMs: 60000,
+            generateHighQualityLinkPreview: false,
+            retryRequestDelayMs: 250
         });
 
         attachEvents();
 
-        // Request code after 3s
+        // Request pairing code after 3s
         setTimeout(async () => {
             if (codeSent || sessionExported || cleaned) return;
             try {
@@ -362,8 +349,7 @@ router.get('/', async (req, res) => {
 });
 
 router.get('/session/:sessionId', (req, res) => {
-    const { sessionId } = req.params;
-    const sessionFile = path.join(TEMP_DIR, sessionId, 'session.txt');
+    const sessionFile = path.join(TEMP_DIR, req.params.sessionId, 'session.txt');
     if (fs.existsSync(sessionFile)) {
         res.json({ success: true, sessionString: fs.readFileSync(sessionFile, 'utf8') });
     } else {
