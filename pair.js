@@ -10,6 +10,9 @@ import zlib from 'zlib';
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Render.com port configuration (will be overridden by main server)
+const PORT = process.env.PORT || 10000;
+const BASE_URL = process.env.BASE_URL || `https://glebot-session.onrender.com`;
 const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',') || [];
 const MAX_CONCURRENT_PAIRINGS = parseInt(process.env.MAX_CONCURRENT_PAIRINGS) || 10;
@@ -19,20 +22,18 @@ const PAIRING_CODE_TIMEOUT = 30000;
 const HANDSHAKE_TIMEOUT = 15000;
 const MAX_MESSAGE_SIZE = 8192;
 
-// Strict CORS
+// CORS - allow all origins since main server handles it
 router.use((req, res, next) => {
-    const origin = req.headers.origin;
-    if (origin && ALLOWED_ORIGINS.includes(origin)) {
-        res.header('Access-Control-Allow-Origin', origin);
-        res.header('Access-Control-Allow-Methods', 'GET');
-        res.header('Access-Control-Allow-Headers', 'Content-Type');
-        next();
-    } else if (!origin && process.env.NODE_ENV === 'development') {
-        res.header('Access-Control-Allow-Origin', '*');
-        next();
-    } else {
-        res.status(403).json({ success: false, error: 'CORS origin not allowed' });
+    // Skip CORS for health check (though health check is at root, not here)
+    if (req.path === '/health') {
+        return next();
     }
+    
+    // Allow all origins for API endpoints
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    next();
 });
 
 const TEMP_DIR = path.join(__dirname, 'temp_sessions');
@@ -40,10 +41,11 @@ const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 
 if (!ENCRYPTION_KEY) {
     console.error('❌ FATAL: ENCRYPTION_KEY is required');
-    process.exit(1);
+    // Don't exit, just log error - main server handles
+    console.error('Please set ENCRYPTION_KEY in environment variables');
 }
 
-const ENCRYPTION_KEY_HASH = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
+const ENCRYPTION_KEY_HASH = ENCRYPTION_KEY ? crypto.createHash('sha256').update(ENCRYPTION_KEY).digest() : null;
 
 if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -94,6 +96,10 @@ function getCredsFile(sessionDir) {
 }
 
 function encryptSession(credsBase64, sessionId) {
+    if (!ENCRYPTION_KEY_HASH) {
+        throw new Error('ENCRYPTION_KEY not configured');
+    }
+    
     const compressed = zlib.deflateSync(credsBase64);
     const compressedBase64 = compressed.toString('base64');
     
@@ -188,7 +194,6 @@ async function forceCleanupNumber(phoneNumber, redactedNumber) {
             try { session.socket.end(); } catch (e) {}
         }
         
-        // Clean up session directory
         const sessionDir = path.join(TEMP_DIR, session.sessionId);
         if (fs.existsSync(sessionDir)) {
             setTimeout(() => removeFile(sessionDir, true), 1000);
@@ -271,13 +276,25 @@ const splitSessionIntoChunks = (sessionString) => {
     return chunks;
 };
 
+// ==================== HEALTH CHECK ENDPOINT ====================
+// Simple health check that doesn't interfere with pairing
+router.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        activePairings: ACTIVE_SESSIONS.size,
+        memory: process.memoryUsage().heapUsed
+    });
+});
+
 // ==================== PAIRING ENDPOINT ====================
 router.get('/', async (req, res) => {
     if (activePairingCount >= MAX_CONCURRENT_PAIRINGS) {
         return res.status(503).json({ 
             success: false, 
             error: 'Server at capacity. Please try again later.',
-            activePairings: activePairingCount
+            activePairings: activePairingCount,
+            maxPairings: MAX_CONCURRENT_PAIRINGS
         });
     }
     
@@ -677,6 +694,7 @@ router.get('/', async (req, res) => {
             rawCode: pairingResult.code,
             sessionId,
             phoneNumber: redactedNumber,
+            baseUrl: BASE_URL,
             message: 'Enter this code in WhatsApp',
             instructions: [
                 '1. WhatsApp → Settings → Linked Devices',
@@ -741,6 +759,8 @@ router.get('/status', (req, res) => {
         activePairings: ACTIVE_SESSIONS.size,
         maxConcurrentPairings: MAX_CONCURRENT_PAIRINGS,
         maxSessions: MAX_SESSIONS,
+        port: PORT,
+        baseUrl: BASE_URL,
         availableSlots: Math.max(0, MAX_CONCURRENT_PAIRINGS - activePairingCount)
     });
 });
