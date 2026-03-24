@@ -7,7 +7,7 @@ import zlib from 'zlib';
 import {
     makeWASocket, useMultiFileAuthState, delay,
     makeCacheableSignalKeyStore, jidNormalizedUser,
-    fetchLatestBaileysVersion, Browsers
+    fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
 import { uploadSession as megaUpload } from './mega.js';
 
@@ -73,80 +73,84 @@ router.get('/', async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const { version } = await fetchLatestBaileysVersion();
         
-        // Create socket
+        // Create socket with correct browser
         sock = makeWASocket({
             version,
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: "silent" }),
-            browser: Browsers.ubuntu("Chrome"),
+            browser: ["Chrome (Linux)", "", ""],
             markOnlineOnConnect: false
         });
         
         sock.ev.on('creds.update', saveCreds);
         
-        // Handle connection when user enters code
+        // Track state
+        let pairingCodeRequested = false;
+        
+        // Handle all connection updates
         sock.ev.on('connection.update', async (update) => {
-            const { connection } = update;
-            console.log(`📡 Connection: ${connection}`);
+            const { connection, lastDisconnect } = update;
+            console.log(`📡 Connection update: ${connection || 'unknown'}`);
             
+            // Handle connection open (user entered code)
             if (connection === 'open') {
-                console.log('✅ User connected!');
+                console.log('✅ User connected! Sending session...');
                 try {
                     const credsData = await fs.readFile(`${sessionDir}/creds.json`);
                     const credsBase64 = credsData.toString('base64');
                     const sessionString = encryptSession(credsBase64);
                     const userJid = jidNormalizedUser(whatsappNumber + '@s.whatsapp.net');
                     
-                    // Send encrypted session
                     await sock.sendMessage(userJid, { text: sessionString });
                     console.log('📤 Session sent');
                     
-                    // Upload to Mega for backup
                     try {
                         const megaLink = await megaUpload(sessionString, sessionDir);
                         if (megaLink && !megaLink.startsWith('local://')) {
-                            await sock.sendMessage(userJid, { text: `💾 *Mega Backup*\n\n${megaLink}` });
-                            console.log('📤 Mega backup sent');
+                            await sock.sendMessage(userJid, { text: `💾 Mega Backup: ${megaLink}` });
                         }
-                    } catch (megaErr) {
-                        console.error('Mega upload failed:', megaErr.message);
-                    }
+                    } catch (e) {}
                     
-                    // Send warning message
                     await sock.sendMessage(userJid, { text: MESSAGE });
-                    
                     await delay(2000);
                     await sock.end();
                     await fs.remove(sessionDir);
                 } catch (err) {
-                    console.error('Error:', err);
+                    console.error('Error sending session:', err);
+                }
+            }
+            
+            // Handle close
+            if (connection === 'close') {
+                console.log(`🔌 Connection closed`);
+                if (lastDisconnect?.error) {
+                    console.error(`Close reason: ${lastDisconnect.error.message}`);
                 }
             }
         });
         
-        // Wait for socket to connect before requesting pairing code
-        console.log('⏳ Waiting for socket to connect...');
+        // Wait for connection to establish
         await new Promise((resolve) => {
             const timeout = setTimeout(() => {
-                console.log('⚠️ Socket connection timeout, proceeding anyway');
+                console.log('⚠️ Connection timeout, proceeding anyway');
                 resolve();
             }, 10000);
             
-            sock.ev.on('connection.update', (update) => {
+            const handler = (update) => {
                 if (update.connection === 'connecting') {
-                    console.log('✅ Socket connected to WhatsApp');
+                    console.log('✅ Socket connected, ready for pairing');
                     clearTimeout(timeout);
+                    sock.ev.off('connection.update', handler);
                     resolve();
                 }
-            });
+            };
+            sock.ev.on('connection.update', handler);
         });
         
-        // Request REAL pairing code from WhatsApp
-        console.log(`🔑 Requesting pairing code from WhatsApp for ${whatsappNumber}...`);
+        // Request pairing code
+        console.log(`🔑 Requesting pairing code for ${whatsappNumber}...`);
         let code = await sock.requestPairingCode(whatsappNumber);
-        
-        // Format the code
         const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
         
         console.log(`✅ Pairing code: ${formattedCode}`);
@@ -156,11 +160,11 @@ router.get('/', async (req, res) => {
             res.json({ 
                 success: true, 
                 code: formattedCode,
-                message: 'Enter this code in WhatsApp: Settings → Linked Devices → Link a Device'
+                message: 'Enter this code in WhatsApp'
             });
         }
         
-        // Cleanup after 2 minutes
+        // Cleanup after timeout
         setTimeout(async () => {
             try {
                 if (sock) await sock.end();
@@ -169,7 +173,7 @@ router.get('/', async (req, res) => {
         }, 120000);
         
     } catch (err) {
-        console.error('❌ Error:', err);
+        console.error('❌ Error:', err.message);
         if (!responseSent) res.status(500).json({ error: err.message });
         if (sock) await sock.end();
         await fs.remove(sessionDir);
