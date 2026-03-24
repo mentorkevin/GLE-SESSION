@@ -1,31 +1,39 @@
 import express from 'express';
-import fs from 'fs';
+import fs from 'fs-extra';
 import pino from 'pino';
-import { makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore, Browsers, jidNormalizedUser, fetchLatestBaileysVersion, DisconnectReason } from '@whiskeysockets/baileys';
 import pn from 'awesome-phonenumber';
-import { uploadSession } from './mega.js';
 import crypto from 'crypto';
 import zlib from 'zlib';
+import {
+    makeWASocket, useMultiFileAuthState, delay,
+    makeCacheableSignalKeyStore, Browsers, jidNormalizedUser,
+    fetchLatestBaileysVersion, DisconnectReason
+} from '@whiskeysockets/baileys';
 
 const router = express.Router();
-const __dirname = process.cwd();
+const MAX_RECONNECT_ATTEMPTS = 3;
+const SESSION_TIMEOUT = 5 * 60 * 1000;
+const CLEANUP_DELAY = 5000;
 
-// Encryption key from environment
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 const ENCRYPTION_KEY_HASH = ENCRYPTION_KEY ? crypto.createHash('sha256').update(ENCRYPTION_KEY).digest() : null;
 
-function makeid() {
-    return crypto.randomBytes(8).toString('hex');
-}
+const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
+const MESSAGE = `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
 
-function removeFile(FilePath) {
+┌┤✑  Thanks for using GleBot
+│└────────────┈ ⳹        
+│ ©2026 GleBot Inc. All rights reserved.
+└─────────────────┈ ⳹
+
+📢 Join our channel: ${CHANNEL_LINK}`;
+
+async function removeFile(FilePath) {
     try {
         if (!fs.existsSync(FilePath)) return false;
-        fs.rmSync(FilePath, { recursive: true, force: true });
-        console.log(`🗑️ Removed: ${FilePath}`);
-    } catch (e) {
-        console.error('Error removing file:', e);
-    }
+        await fs.remove(FilePath);
+        return true;
+    } catch (e) { console.error('Error removing file:', e); return false; }
 }
 
 function encryptSession(credsBase64, sessionId) {
@@ -52,196 +60,237 @@ function encryptSession(credsBase64, sessionId) {
 }
 
 router.get('/', async (req, res) => {
-    const id = makeid();
     let num = req.query.number;
-    const sessionDir = './temp/' + id;
+    if (!num) return res.status(400).send({ success: false, error: 'Phone number is required' });
+
+    // Clean phone number
+    num = num.replace(/[^0-9]/g, '');
     
-    async function GLEBOT_PAIR_CODE() {
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        
-        try {
-            const { version } = await fetchLatestBaileysVersion();
-            let GleBot = makeWASocket({
-                version,
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-                },
-                printQRInTerminal: false,
-                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-                browser: Browsers.windows('Chrome'),
-                markOnlineOnConnect: false,
-                generateHighQualityLinkPreview: false,
-                defaultQueryTimeoutMs: 60000,
-                connectTimeoutMs: 60000,
-                keepAliveIntervalMs: 30000,
-                retryRequestDelayMs: 250,
-                maxRetries: 5,
-            });
-            
-            // Request pairing code if not registered
-            if (!GleBot.authState.creds.registered) {
-                await delay(1500);
-                let cleanNum = num.replace(/[^0-9]/g, '');
-                console.log(`🔑 Requesting pairing code for ${cleanNum}...`);
-                const code = await GleBot.requestPairingCode(cleanNum);
-                const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
-                
-                if (!res.headersSent) {
-                    console.log(`✅ Pairing code: ${formattedCode}`);
-                    await res.send({ 
-                        success: true, 
-                        code: formattedCode,
-                        sessionId: id,
-                        message: 'Enter this code in WhatsApp'
-                    });
-                }
-            }
-            
-            // Handle credentials update
-            GleBot.ev.on('creds.update', saveCreds);
-            
-            // Handle connection updates
-            GleBot.ev.on("connection.update", async (s) => {
-                const { connection, lastDisconnect } = s;
-                
-                if (connection === "open") {
-                    console.log("✅ Connected successfully!");
-                    await delay(5000);
-                    
-                    try {
-                        // Read creds.json
-                        const credsPath = sessionDir + '/creds.json';
-                        if (!fs.existsSync(credsPath)) {
-                            throw new Error('creds.json not found');
-                        }
-                        
-                        const credsBase64 = fs.readFileSync(credsPath).toString('base64');
-                        
-                        // Encrypt the session
-                        const sessionString = encryptSession(credsBase64, id);
-                        
-                        // Save encrypted session to file
-                        const sessionFile = sessionDir + '/session.txt';
-                        fs.writeFileSync(sessionFile, sessionString);
-                        
-                        // Send encrypted session to user
-                        const userJid = jidNormalizedUser(cleanNum + '@s.whatsapp.net');
-                        
-                        // Split into chunks if too long
-                        const maxChunkSize = 60000;
-                        if (sessionString.length > maxChunkSize) {
-                            const chunks = [];
-                            for (let i = 0; i < sessionString.length; i += maxChunkSize) {
-                                chunks.push(sessionString.slice(i, i + maxChunkSize));
-                            }
-                            
-                            for (let i = 0; i < chunks.length; i++) {
-                                await delay(2000);
-                                await GleBot.sendMessage(userJid, {
-                                    text: `📦 *Session Part ${i+1}/${chunks.length}*\n\n${chunks[i]}`
-                                });
-                            }
-                            await GleBot.sendMessage(userJid, { text: `✅ *Session Complete!*` });
-                        } else {
-                            await GleBot.sendMessage(userJid, { text: sessionString });
-                        }
-                        console.log("📄 Session sent successfully");
-                        
-                        // Send warning and channel link
-                        const messageText = `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
-
-┌┤✑  Thanks for using GleBot
-│└────────────┈ ⳹        
-│ ©2026 GleBot Inc. All rights reserved.
-└─────────────────┈ ⳹
-
-📢 Join our channel: https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x`;
-                        
-                        await GleBot.sendMessage(userJid, { text: messageText });
-                        console.log("📢 Channel link sent successfully");
-                        
-                        // Upload to Mega in background
-                        setTimeout(async () => {
-                            try {
-                                const megaUrl = await uploadSession(sessionString, id);
-                                if (megaUrl && !megaUrl.startsWith('local://')) {
-                                    await GleBot.sendMessage(userJid, { text: `💾 *Mega Backup*\n\n${megaUrl}` });
-                                }
-                            } catch (e) {
-                                console.error('Mega upload failed:', e.message);
-                            }
-                        }, 5000);
-                        
-                        // Close connection and cleanup
-                        await delay(2000);
-                        await GleBot.ws.close();
-                        removeFile(sessionDir);
-                        console.log("✅ Session cleaned up successfully");
-                        
-                    } catch (error) {
-                        console.error("❌ Error sending messages:", error);
-                        removeFile(sessionDir);
-                    }
-                    
-                } else if (connection === "close" && lastDisconnect && lastDisconnect.error && lastDisconnect.error.output?.statusCode !== 401) {
-                    console.log("🔁 Connection closed — restarting...");
-                    await delay(10000);
-                    GLEBOT_PAIR_CODE();
-                }
-            });
-            
-        } catch (err) {
-            console.log("❌ Service error:", err);
-            removeFile(sessionDir);
-            if (!res.headersSent) {
-                await res.send({ success: false, error: "Service Unavailable" });
-            }
+    // Validate phone number
+    let phone = pn('+' + num);
+    if (!phone.isValid()) {
+        if (num.length === 10 && !num.startsWith('1')) {
+            num = '1' + num;
+        } else if (num.length === 9 && num.startsWith('7')) {
+            num = '254' + num;
+        } else if (num.length === 10 && num.startsWith('7')) {
+            num = '254' + num;
+        } else {
+            return res.status(400).send({ success: false, error: 'Invalid phone number. Please include country code' });
+        }
+        phone = pn('+' + num);
+        if (!phone.isValid()) {
+            return res.status(400).send({ success: false, error: 'Invalid phone number' });
         }
     }
     
-    return await GLEBOT_PAIR_CODE();
-});
-
-// Session retrieval endpoint
-router.get('/session/:sessionId', (req, res) => {
-    const { sessionId } = req.params;
-    const sessionFile = `./temp/${sessionId}/session.txt`;
+    num = phone.getNumber('e164').replace('+', '');
     
-    if (fs.existsSync(sessionFile)) {
-        const sessionString = fs.readFileSync(sessionFile, 'utf8');
-        res.json({ success: true, sessionId, session: sessionString });
-    } else {
-        res.status(404).json({ success: false, error: 'Session not found' });
+    const sessionId = Date.now().toString() + Math.random().toString(36).substring(2, 9);
+    const dirs = `./temp/session_${sessionId}`;
+
+    let pairingCodeSent = false, sessionCompleted = false, isCleaningUp = false;
+    let responseSent = false, reconnectAttempts = 0, currentSocket = null, timeoutHandle = null;
+
+    async function cleanup(reason = 'unknown') {
+        if (isCleaningUp) return;
+        isCleaningUp = true;
+        console.log(`🧹 Cleanup ${sessionId} - ${reason}`);
+        if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
+        if (currentSocket) {
+            try { currentSocket.ev.removeAllListeners(); await currentSocket.end(); } catch (e) {}
+            currentSocket = null;
+        }
+        setTimeout(async () => { await removeFile(dirs); }, CLEANUP_DELAY);
     }
+
+    async function initiateSession() {
+        if (sessionCompleted || isCleaningUp) return;
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            if (!responseSent && !res.headersSent) { 
+                responseSent = true; 
+                res.status(503).send({ success: false, error: 'Connection failed after multiple attempts' }); 
+            }
+            await cleanup('max_reconnects'); 
+            return;
+        }
+        
+        try {
+            await fs.ensureDir(dirs);
+            const { state, saveCreds } = await useMultiFileAuthState(dirs);
+            const { version } = await fetchLatestBaileysVersion();
+
+            if (currentSocket) {
+                try { currentSocket.ev.removeAllListeners(); await currentSocket.end(); } catch (e) {}
+            }
+
+            currentSocket = makeWASocket({
+                version,
+                auth: { 
+                    creds: state.creds, 
+                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })) 
+                },
+                printQRInTerminal: false, 
+                logger: pino({ level: "silent" }),
+                browser: Browsers.macOS('Chrome'), 
+                markOnlineOnConnect: false,
+                generateHighQualityLinkPreview: false, 
+                defaultQueryTimeoutMs: 60000,
+                connectTimeoutMs: 60000, 
+                keepAliveIntervalMs: 30000, 
+                retryRequestDelayMs: 250, 
+                maxRetries: 3,
+            });
+
+            const sock = currentSocket;
+
+            sock.ev.on('connection.update', async (update) => {
+                if (isCleaningUp) return;
+                const { connection, lastDisconnect, isNewLogin } = update;
+
+                if (connection === 'open') {
+                    if (sessionCompleted) return;
+                    sessionCompleted = true;
+                    console.log(`✅ Connected successfully!`);
+                    
+                    try {
+                        const credsFile = `${dirs}/creds.json`;
+                        if (fs.existsSync(credsFile)) {
+                            const credsBase64 = (await fs.readFile(credsFile)).toString('base64');
+                            const sessionString = encryptSession(credsBase64, sessionId);
+                            const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
+                            
+                            // Send encrypted session directly
+                            await sock.sendMessage(userJid, { text: sessionString });
+                            console.log(`📤 Session sent`);
+                            
+                            // Send warning message
+                            await sock.sendMessage(userJid, { text: MESSAGE });
+                            console.log(`📢 Warning message sent`);
+                            
+                            await delay(1000);
+                        }
+                    } catch (err) { 
+                        console.error('Error sending session:', err); 
+                    } finally { 
+                        await cleanup('session_complete'); 
+                    }
+                }
+
+                if (isNewLogin) console.log(`🔐 New login via pair code`);
+
+                if (connection === 'close') {
+                    if (sessionCompleted || isCleaningUp) { 
+                        await cleanup('already_complete'); 
+                        return; 
+                    }
+                    
+                    const statusCode = lastDisconnect?.error?.output?.statusCode;
+                    
+                    if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                        if (!responseSent && !res.headersSent) { 
+                            responseSent = true; 
+                            res.status(401).send({ success: false, error: 'Invalid pairing code or session expired' }); 
+                        }
+                        await cleanup('logged_out');
+                    } else if (pairingCodeSent && !sessionCompleted) {
+                        reconnectAttempts++;
+                        console.log(`🔄 Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+                        await delay(2000); 
+                        await initiateSession();
+                    } else { 
+                        await cleanup('connection_closed'); 
+                    }
+                }
+            });
+
+            // Request pairing code
+            if (!sock.authState.creds.registered && !pairingCodeSent && !isCleaningUp) {
+                await delay(1500);
+                try {
+                    pairingCodeSent = true;
+                    console.log(`🔑 Requesting pairing code for ${num}...`);
+                    let code = await sock.requestPairingCode(num);
+                    code = code?.match(/.{1,4}/g)?.join('-') || code;
+                    
+                    if (!responseSent && !res.headersSent) { 
+                        responseSent = true; 
+                        console.log(`✅ Pairing code: ${code}`);
+                        res.send({ 
+                            success: true, 
+                            code: code, 
+                            sessionId: sessionId
+                        }); 
+                    }
+                } catch (error) {
+                    console.error('Error requesting pairing code:', error);
+                    pairingCodeSent = false;
+                    if (!responseSent && !res.headersSent) { 
+                        responseSent = true; 
+                        res.status(503).send({ success: false, error: 'Failed to get pairing code' }); 
+                    }
+                    await cleanup('pairing_code_error');
+                }
+            }
+
+            sock.ev.on('creds.update', saveCreds);
+
+            timeoutHandle = setTimeout(async () => {
+                if (!sessionCompleted && !isCleaningUp) {
+                    if (!responseSent && !res.headersSent) { 
+                        responseSent = true; 
+                        res.status(408).send({ success: false, error: 'Pairing timeout' }); 
+                    }
+                    await cleanup('timeout');
+                }
+            }, SESSION_TIMEOUT);
+
+        } catch (err) {
+            console.error(`❌ Error initializing session:`, err);
+            if (!responseSent && !res.headersSent) { 
+                responseSent = true; 
+                res.status(503).send({ success: false, error: 'Service Unavailable' }); 
+            }
+            await cleanup('init_error');
+        }
+    }
+
+    await initiateSession();
 });
 
-// Status endpoint
-router.get('/status', (req, res) => {
+// Cleanup old sessions
+setInterval(async () => {
+    try {
+        const baseDir = './temp';
+        if (!fs.existsSync(baseDir)) return;
+        const sessions = await fs.readdir(baseDir);
+        const now = Date.now();
+        for (const session of sessions) {
+            try {
+                const stats = await fs.stat(`${baseDir}/${session}`);
+                if (now - stats.mtimeMs > 10 * 60 * 1000) {
+                    await fs.remove(`${baseDir}/${session}`);
+                }
+            } catch (e) {}
+        }
+    } catch (e) {}
+}, 60000);
+
+router.get('/status', async (req, res) => {
     const tempDir = './temp';
-    const sessions = fs.existsSync(tempDir) ? fs.readdirSync(tempDir).length : 0;
+    const sessions = fs.existsSync(tempDir) ? await fs.readdir(tempDir) : [];
     res.json({
         success: true,
-        activeSessions: sessions,
-        encryptionConfigured: !!ENCRYPTION_KEY
+        activeSessions: sessions.length
     });
 });
 
-// Global uncaught exception handler
+process.on('SIGTERM', async () => { try { await fs.remove('./temp'); } catch (e) {} process.exit(0); });
+process.on('SIGINT', async () => { try { await fs.remove('./temp'); } catch (e) {} process.exit(0); });
 process.on('uncaughtException', (err) => {
-    let e = String(err);
-    if (e.includes("conflict")) return;
-    if (e.includes("not-authorized")) return;
-    if (e.includes("Socket connection timeout")) return;
-    if (e.includes("rate-overlimit")) return;
-    if (e.includes("Connection Closed")) return;
-    if (e.includes("Timed Out")) return;
-    if (e.includes("Value not found")) return;
-    if (e.includes("Stream Errored")) return;
-    if (e.includes("Stream Errored (restart required)")) return;
-    if (e.includes("statusCode: 515")) return;
-    if (e.includes("statusCode: 503")) return;
-    console.log('Caught exception: ', err);
+    const e = String(err);
+    const ignore = ["conflict","not-authorized","Socket connection timeout","rate-overlimit","Connection Closed","Timed Out","Value not found","Stream Errored","statusCode: 515","statusCode: 503","QR refs"];
+    if (!ignore.some(x => e.includes(x))) console.log('Caught exception:', err);
 });
 
 export default router;
