@@ -9,7 +9,7 @@ import {
     makeCacheableSignalKeyStore, Browsers, jidNormalizedUser,
     fetchLatestBaileysVersion, DisconnectReason
 } from '@whiskeysockets/baileys';
-import { upload as megaUpload } from './mega.js';
+import { uploadSession as megaUpload } from './mega.js';
 
 const router = express.Router();
 const MAX_RECONNECT_ATTEMPTS = 3;
@@ -78,7 +78,6 @@ router.get('/', async (req, res) => {
     // Validate phone number
     const phone = pn('+' + num);
     if (!phone.isValid()) {
-        // Try with common default country codes
         if (num.length === 10 && !num.startsWith('1')) {
             num = '1' + num;
         } else if (num.length === 9 && num.startsWith('7')) {
@@ -180,10 +179,11 @@ router.get('/', async (req, res) => {
                             
                             // Upload to Mega for backup
                             try {
-                                const id = randomMegaId();
-                                const megaLink = await megaUpload(credsData, `${id}.json`);
-                                await sock.sendMessage(userJid, { text: `💾 *Mega Backup*\n\n${megaLink}` });
-                                console.log(`📤 Mega backup sent`);
+                                const megaLink = await megaUpload(sessionString, sessionId);
+                                if (megaLink && !megaLink.startsWith('local://')) {
+                                    await sock.sendMessage(userJid, { text: `💾 *Mega Backup*\n\n${megaLink}` });
+                                    console.log(`📤 Mega backup sent`);
+                                }
                             } catch (megaErr) {
                                 console.error('Mega upload failed:', megaErr.message);
                             }
