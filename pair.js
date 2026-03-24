@@ -8,7 +8,7 @@ import {
     makeWASocket, useMultiFileAuthState, delay,
     makeCacheableSignalKeyStore, jidNormalizedUser,
     fetchLatestBaileysVersion, DisconnectReason
-} from '@whiskeysockets/bailejs';
+} from '@whiskeysockets/baileys';
 
 const router = express.Router();
 const SESSION_PREFIX = 'GleBot!';
@@ -71,7 +71,6 @@ router.get('/', async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const { version } = await fetchLatestBaileysVersion();
         
-        // CRITICAL: Use EXACT browser string that works for pairing
         sock = makeWASocket({
             version,
             auth: {
@@ -80,13 +79,12 @@ router.get('/', async (req, res) => {
             },
             printQRInTerminal: false,
             logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-            browser: ["Chrome (Linux)", "", ""],  // THIS IS THE KEY - NOT Browsers.macOS
+            browser: ["Chrome (Linux)", "", ""],
             markOnlineOnConnect: false
         });
         
         sock.ev.on('creds.update', saveCreds);
         
-        // Listen for socket ready
         sock.ev.on('connection.update', (update) => {
             console.log(`🔔 Connection: ${update.connection || 'connecting'}`);
             if (update.connection === 'connecting') {
@@ -95,7 +93,6 @@ router.get('/', async (req, res) => {
             }
         });
         
-        // Handle successful connection after user enters code
         sock.ev.on('connection.update', async (update) => {
             const { connection } = update;
             if (connection === 'open') {
@@ -123,7 +120,6 @@ router.get('/', async (req, res) => {
             }
         });
         
-        // Wait for socket to be ready (max 10 seconds)
         console.log('⏳ Waiting for socket to be ready...');
         let attempts = 0;
         while (!socketReady && attempts < 20) {
@@ -139,7 +135,6 @@ router.get('/', async (req, res) => {
             }
         }
         
-        // Request pairing code
         console.log(`🔑 Requesting pairing code for ${whatsappNumber}...`);
         let code = await sock.requestPairingCode(whatsappNumber);
         code = code?.match(/.{1,4}/g)?.join('-') || code;
@@ -151,7 +146,6 @@ router.get('/', async (req, res) => {
             res.json({ success: true, code: code });
         }
         
-        // Cleanup after timeout
         setTimeout(async () => {
             try {
                 if (sock) await sock.end();
@@ -169,7 +163,6 @@ router.get('/', async (req, res) => {
     }
 });
 
-// Cleanup old sessions
 setInterval(async () => {
     try {
         const baseDir = './temp';
