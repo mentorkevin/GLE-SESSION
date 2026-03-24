@@ -16,6 +16,7 @@ const MAX_CONCURRENT_PAIRINGS = parseInt(process.env.MAX_CONCURRENT_PAIRINGS) ||
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 100;
 const PAIRING_TIMEOUT = 120000;
 const PAIRING_CODE_TIMEOUT = 30000;
+const HANDSHAKE_TIMEOUT = 15000; // Time to wait for handshake completion
 const MAX_MESSAGE_SIZE = 8192;
 
 // Strict CORS
@@ -50,7 +51,7 @@ if (!fs.existsSync(TEMP_DIR)) {
 
 const CLEANUP_AGE = 3600000;
 const RATE_LIMIT_MAP = new Map();
-const ACTIVE_SESSIONS = new Map(); // Single source of truth: Map<phoneNumber, {sessionId, timestamp, socket, state, cleanupTimeout}>
+const ACTIVE_SESSIONS = new Map();
 let activePairingCount = 0;
 
 let cachedVersion = null;
@@ -172,7 +173,8 @@ function isDeviceLimitError(error) {
     return errorStr.includes('device') || 
            errorStr.includes('limit') || 
            errorStr.includes('too many') ||
-           errorStr.includes('max devices');
+           errorStr.includes('max devices') ||
+           errorStr.includes('already linked');
 }
 
 // Cleanup old session directories
@@ -277,7 +279,6 @@ router.get('/', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Invalid phone number format' });
     }
     
-    // Check for existing session
     if (ACTIVE_SESSIONS.has(formattedNumber)) {
         const activeSession = ACTIVE_SESSIONS.get(formattedNumber);
         const elapsed = Math.floor((Date.now() - activeSession.timestamp) / 1000);
@@ -308,8 +309,8 @@ router.get('/', async (req, res) => {
     let credsListener = null;
     let megaTimer = null;
     let cleanupTimer = null;
-    let reconnectAttempts = 0;
-    const MAX_RECONNECT_ATTEMPTS = 3;
+    let handshakeCompleted = false;
+    let handshakeResolver = null;
     
     // Register session
     ACTIVE_SESSIONS.set(formattedNumber, {
@@ -327,11 +328,9 @@ router.get('/', async (req, res) => {
         cleaned = true;
         console.log(`🧹 [${sessionId}] Cleanup (${reason}) scheduled`);
         
-        // Clear all timers
         if (megaTimer) clearTimeout(megaTimer);
         if (cleanupTimer) clearTimeout(cleanupTimer);
         
-        // Remove from active sessions
         if (ACTIVE_SESSIONS.has(formattedNumber)) {
             const session = ACTIVE_SESSIONS.get(formattedNumber);
             if (session.cleanupTimeout) clearTimeout(session.cleanupTimeout);
@@ -339,11 +338,9 @@ router.get('/', async (req, res) => {
             console.log(`🗑️ [${sessionId}] Removed ${redactedNumber} from active sessions`);
         }
         
-        // Decrement counter
         activePairingCount = Math.max(0, activePairingCount - 1);
         console.log(`📊 Active pairings after cleanup: ${activePairingCount}`);
         
-        // Remove listeners and close socket
         if (currentSock) {
             if (connectionListener) currentSock.ev.off('connection.update', connectionListener);
             if (credsListener) currentSock.ev.off('creds.update', credsListener);
@@ -351,7 +348,6 @@ router.get('/', async (req, res) => {
             try { currentSock.end(); } catch (e) {}
         }
         
-        // Schedule directory removal
         if (sessionDirCreated && fs.existsSync(sessionDir)) {
             setTimeout(() => {
                 if (fs.existsSync(sessionDir)) removeFile(sessionDir, true);
@@ -366,216 +362,43 @@ router.get('/', async (req, res) => {
         }
     };
     
-    const reconnectSocket = async () => {
-        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            console.error(`❌ [${sessionId}] Max reconnect attempts reached`);
-            return null;
-        }
-        
-        reconnectAttempts++;
-        console.log(`🔄 [${sessionId}] Reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
-        
-        try {
-            // Clean up old socket
-            if (currentSock) {
-                if (connectionListener) currentSock.ev.off('connection.update', connectionListener);
-                if (credsListener) currentSock.ev.off('creds.update', credsListener);
-                try { currentSock.end(); } catch (e) {}
-            }
+    // Wait for WhatsApp handshake to complete
+    const waitForHandshake = (socket, timeoutMs = HANDSHAKE_TIMEOUT) => {
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                if (!handshakeCompleted) {
+                    reject(new Error('Handshake timeout - WhatsApp not responding'));
+                }
+            }, timeoutMs);
             
-            // Create new socket
-            const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-            saveCredsFn = saveCreds;
-            const version = await getCachedVersion();
-            
-            const newSock = makeWASocket({
-                version,
-                auth: state,
-                browser: Browsers.macOS("Chrome"),
-                printQRInTerminal: false,
-                markOnlineOnConnect: false,
-                connectTimeoutMs: 60000,
-                defaultQueryTimeoutMs: 60000,
-                keepAliveIntervalMs: 30000
-            });
-            
-            // Reattach listeners
-            credsListener = async (creds) => {
-                console.log(`💾 [${sessionId}] creds.update - registered: ${creds?.registered}`);
-                try {
-                    if (saveCredsFn) await saveCredsFn();
-                } catch (err) {
-                    console.error(`❌ [${sessionId}] Failed to save creds:`, err.message);
+            const handshakeHandler = (update) => {
+                const { connection, lastDisconnect } = update;
+                
+                // Handshake is complete when we get "connecting" state or later
+                // This means WhatsApp has acknowledged the connection
+                if (connection === 'connecting' || connection === 'open') {
+                    handshakeCompleted = true;
+                    clearTimeout(timeout);
+                    socket.ev.off('connection.update', handshakeHandler);
+                    resolve();
+                }
+                
+                if (lastDisconnect?.error) {
+                    handshakeCompleted = true;
+                    clearTimeout(timeout);
+                    socket.ev.off('connection.update', handshakeHandler);
+                    reject(new Error(`Handshake error: ${lastDisconnect.error.message}`));
                 }
             };
-            newSock.ev.on('creds.update', credsListener);
             
-            connectionListener = async (update) => {
-                await handleConnectionUpdate(update, newSock);
-            };
-            newSock.ev.on('connection.update', connectionListener);
-            
-            // Update session reference
-            if (ACTIVE_SESSIONS.has(formattedNumber)) {
-                ACTIVE_SESSIONS.get(formattedNumber).socket = newSock;
-            }
-            
-            return newSock;
-            
-        } catch (err) {
-            console.error(`❌ [${sessionId}] Reconnect failed:`, err.message);
-            return null;
-        }
-    };
-    
-    const handleConnectionUpdate = async (update, socket) => {
-        try {
-            const { connection, lastDisconnect } = update;
-            
-            console.log(`[${sessionId}] Connection: ${connection || 'connecting'}`);
-            
-            // Handle connection close - attempt recovery
-            if (connection === 'close') {
-                console.log(`⚠️ [${sessionId}] Connection closed`);
-                
-                if (!sessionExported && !userConnected) {
-                    console.log(`🔄 [${sessionId}] Attempting to recover...`);
-                    const newSock = await reconnectSocket();
-                    if (newSock) {
-                        currentSock = newSock;
-                        // Retry pairing with new socket
-                        const retryResult = await requestPairingWithRetry(currentSock, formattedNumber);
-                        if (retryResult.success && !responseSent) {
-                            const formattedCode = retryResult.code.match(/.{1,4}/g)?.join('-') || retryResult.code;
-                            sendResponse({
-                                success: true,
-                                code: formattedCode,
-                                rawCode: retryResult.code,
-                                sessionId,
-                                phoneNumber: redactedNumber,
-                                message: 'Enter this code in WhatsApp',
-                                instructions: [
-                                    '1. WhatsApp → Settings → Linked Devices',
-                                    '2. Tap "Link a Device"',
-                                    `3. Enter code: ${formattedCode}`,
-                                    '4. Wait for connection...'
-                                ]
-                            });
-                        }
-                    }
-                }
-                return;
-            }
-            
-            if (lastDisconnect?.error) {
-                const statusCode = lastDisconnect.error?.output?.statusCode;
-                if (statusCode === DisconnectReason.loggedOut) {
-                    console.log(`⚠️ [${sessionId}] User logged out`);
-                    cleanup(5000, 'logged_out');
-                    return;
-                }
-                console.error(`❌ [${sessionId}] Error:`, lastDisconnect.error.message);
-            }
-            
-            // Check for successful connection
-            if (connection === 'open' && socket?.user?.id && !sessionExported && !userConnected) {
-                const connectedNumber = socket.user.id.split(':')[0];
-                const phoneMatches = connectedNumber === formattedNumber;
-                
-                console.log(`🎉 [${sessionId}] Connection open! Phone match: ${phoneMatches}`);
-                
-                if (phoneMatches) {
-                    userConnected = true;
-                    
-                    // Update session state
-                    if (ACTIVE_SESSIONS.has(formattedNumber)) {
-                        ACTIVE_SESSIONS.get(formattedNumber).state = 'connected';
-                    }
-                    
-                    await delay(2000);
-                    
-                    // Wait for creds file
-                    const credsPath = path.join(sessionDir, 'creds.json');
-                    let credsWait = 0;
-                    while (!fs.existsSync(credsPath) && credsWait < 30) {
-                        await delay(500);
-                        credsWait++;
-                    }
-                    
-                    const credsBase64 = getCredsFile(sessionDir);
-                    if (!credsBase64) {
-                        console.error(`❌ [${sessionId}] creds.json not found`);
-                        cleanup(5000, 'no_creds');
-                        return;
-                    }
-                    
-                    const sessionString = encryptSession(credsBase64, sessionId);
-                    const sessionFile = path.join(sessionDir, 'session.txt');
-                    fs.writeFileSync(sessionFile, sessionString);
-                    
-                    const userJid = socket.user.id;
-                    console.log(`📤 [${sessionId}] Sending session...`);
-                    
-                    const chunks = splitSessionIntoChunks(sessionString);
-                    let sendSuccess = true;
-                    
-                    try {
-                        if (chunks.length === 1) {
-                            await socket.sendMessage(userJid, { text: sessionString });
-                        } else {
-                            for (let i = 0; i < chunks.length; i++) {
-                                await delay(2000);
-                                await socket.sendMessage(userJid, { 
-                                    text: `📦 *Part ${i+1}/${chunks.length}*\n\n${chunks[i]}` 
-                                });
-                            }
-                            await socket.sendMessage(userJid, { text: `✅ *Complete!*` });
-                        }
-                        
-                        await socket.sendMessage(userJid, {
-                            text: `⚠️ *DO NOT SHARE THIS SESSION* ⚠️\n\nThanks for using GleBot\n\n📢 Join: ${CHANNEL_LINK}`
-                        });
-                        
-                        console.log(`✅ [${sessionId}] Session exported`);
-                        sessionExported = true;
-                        
-                        // Mega backup
-                        if (!megaUploadStarted) {
-                            megaUploadStarted = true;
-                            megaTimer = setTimeout(async () => {
-                                try {
-                                    const megaUrl = await uploadSession(sessionString, sessionId);
-                                    if (megaUrl && !megaUrl.startsWith('local://') && socket?.user) {
-                                        await socket.sendMessage(userJid, { 
-                                            text: `💾 *Mega Backup*\n\n${megaUrl}` 
-                                        });
-                                    }
-                                } catch (e) {
-                                    console.error(`Mega failed:`, e.message);
-                                }
-                            }, 15000);
-                        }
-                        
-                        // Success cleanup
-                        cleanupTimer = setTimeout(() => cleanup(5000, 'success'), 5000);
-                        
-                    } catch (err) {
-                        console.error(`❌ [${sessionId}] Send failed:`, err.message);
-                        cleanup(5000, 'send_failed');
-                    }
-                }
-            }
-        } catch (err) {
-            console.error(`❌ [${sessionId}] Connection handler error:`, err);
-        }
+            socket.ev.on('connection.update', handshakeHandler);
+        });
     };
     
     const requestPairingWithRetry = async (socket, phoneNumber, maxRetries = 3) => {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 console.log(`🔑 [${sessionId}] Requesting pairing code (attempt ${attempt}/${maxRetries})...`);
-                
-                if (attempt === 1) await delay(2000);
                 
                 const code = await Promise.race([
                     socket.requestPairingCode(phoneNumber),
@@ -586,15 +409,8 @@ router.get('/', async (req, res) => {
                 
             } catch (err) {
                 console.error(`❌ [${sessionId}] Attempt ${attempt} failed:`, err.message);
-                
-                // Check if socket is dead and need recreation
                 if (attempt < maxRetries) {
-                    const newSock = await reconnectSocket();
-                    if (newSock) {
-                        socket = newSock;
-                        currentSock = socket;
-                    }
-                    await delay(3000);
+                    await delay(2000);
                 }
             }
         }
@@ -630,7 +446,7 @@ router.get('/', async (req, res) => {
             ACTIVE_SESSIONS.get(formattedNumber).socket = currentSock;
         }
         
-        // Set up listeners
+        // Set up creds listener
         credsListener = async (creds) => {
             console.log(`💾 [${sessionId}] creds.update - registered: ${creds?.registered}`);
             try {
@@ -641,12 +457,128 @@ router.get('/', async (req, res) => {
         };
         currentSock.ev.on('creds.update', credsListener);
         
+        // Wait for handshake BEFORE requesting pairing code
+        console.log(`⏳ [${sessionId}] Waiting for WhatsApp handshake...`);
+        try {
+            await waitForHandshake(currentSock);
+            console.log(`✅ [${sessionId}] Handshake complete, ready for pairing`);
+        } catch (err) {
+            console.error(`❌ [${sessionId}] Handshake failed:`, err.message);
+            sendResponse({
+                success: false,
+                error: `WhatsApp handshake failed: ${err.message}`,
+                sessionId
+            });
+            cleanup(5000, 'handshake_failed');
+            return;
+        }
+        
+        // Set up connection listener for post-pairing events
         connectionListener = async (update) => {
-            await handleConnectionUpdate(update, currentSock);
+            try {
+                const { connection, lastDisconnect } = update;
+                console.log(`[${sessionId}] Connection: ${connection || 'connecting'}`);
+                
+                if (lastDisconnect?.error) {
+                    const statusCode = lastDisconnect.error?.output?.statusCode;
+                    if (statusCode === DisconnectReason.loggedOut) {
+                        console.log(`⚠️ [${sessionId}] User logged out`);
+                        cleanup(5000, 'logged_out');
+                        return;
+                    }
+                }
+                
+                if (connection === 'open' && currentSock?.user?.id && !sessionExported && !userConnected) {
+                    const connectedNumber = currentSock.user.id.split(':')[0];
+                    const phoneMatches = connectedNumber === formattedNumber;
+                    
+                    console.log(`🎉 [${sessionId}] Connection open! Phone match: ${phoneMatches}`);
+                    
+                    if (phoneMatches) {
+                        userConnected = true;
+                        
+                        // Update session state
+                        if (ACTIVE_SESSIONS.has(formattedNumber)) {
+                            ACTIVE_SESSIONS.get(formattedNumber).state = 'connected';
+                        }
+                        
+                        await delay(2000);
+                        
+                        // Wait for creds file
+                        let credsWait = 0;
+                        while (!fs.existsSync(path.join(sessionDir, 'creds.json')) && credsWait < 30) {
+                            await delay(500);
+                            credsWait++;
+                        }
+                        
+                        const credsBase64 = getCredsFile(sessionDir);
+                        if (!credsBase64) {
+                            console.error(`❌ [${sessionId}] creds.json not found`);
+                            cleanup(5000, 'no_creds');
+                            return;
+                        }
+                        
+                        const sessionString = encryptSession(credsBase64, sessionId);
+                        const sessionFile = path.join(sessionDir, 'session.txt');
+                        fs.writeFileSync(sessionFile, sessionString);
+                        
+                        const userJid = currentSock.user.id;
+                        console.log(`📤 [${sessionId}] Sending session...`);
+                        
+                        const chunks = splitSessionIntoChunks(sessionString);
+                        
+                        try {
+                            if (chunks.length === 1) {
+                                await currentSock.sendMessage(userJid, { text: sessionString });
+                            } else {
+                                for (let i = 0; i < chunks.length; i++) {
+                                    await delay(2000);
+                                    await currentSock.sendMessage(userJid, { 
+                                        text: `📦 *Part ${i+1}/${chunks.length}*\n\n${chunks[i]}` 
+                                    });
+                                }
+                                await currentSock.sendMessage(userJid, { text: `✅ *Complete!*` });
+                            }
+                            
+                            await currentSock.sendMessage(userJid, {
+                                text: `⚠️ *DO NOT SHARE THIS SESSION* ⚠️\n\nThanks for using GleBot\n\n📢 Join: ${CHANNEL_LINK}`
+                            });
+                            
+                            console.log(`✅ [${sessionId}] Session exported`);
+                            sessionExported = true;
+                            
+                            // Mega backup
+                            if (!megaUploadStarted) {
+                                megaUploadStarted = true;
+                                megaTimer = setTimeout(async () => {
+                                    try {
+                                        const megaUrl = await uploadSession(sessionString, sessionId);
+                                        if (megaUrl && !megaUrl.startsWith('local://') && currentSock?.user) {
+                                            await currentSock.sendMessage(userJid, { 
+                                                text: `💾 *Mega Backup*\n\n${megaUrl}` 
+                                            });
+                                        }
+                                    } catch (e) {
+                                        console.error(`Mega failed:`, e.message);
+                                    }
+                                }, 15000);
+                            }
+                            
+                            cleanupTimer = setTimeout(() => cleanup(5000, 'success'), 5000);
+                            
+                        } catch (err) {
+                            console.error(`❌ [${sessionId}] Send failed:`, err.message);
+                            cleanup(5000, 'send_failed');
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error(`❌ [${sessionId}] Connection handler error:`, err);
+            }
         };
         currentSock.ev.on('connection.update', connectionListener);
         
-        // Request pairing code
+        // NOW request pairing code (after handshake is complete)
         const pairingResult = await requestPairingWithRetry(currentSock, formattedNumber);
         
         if (!pairingResult.success) {
