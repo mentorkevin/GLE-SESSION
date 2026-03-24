@@ -10,30 +10,30 @@ import zlib from 'zlib';
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Render.com port configuration (will be overridden by main server)
-const PORT = process.env.PORT || 10000;
-const BASE_URL = process.env.BASE_URL || `https://glebot-session.onrender.com`;
 const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',') || [];
 const MAX_CONCURRENT_PAIRINGS = parseInt(process.env.MAX_CONCURRENT_PAIRINGS) || 10;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 100;
 const PAIRING_TIMEOUT = 120000;
 const PAIRING_CODE_TIMEOUT = 30000;
-const HANDSHAKE_TIMEOUT = 15000;
+const CONNECTION_STABILITY_DELAY = 5000; // 5 seconds to ensure connection is stable
 const MAX_MESSAGE_SIZE = 8192;
 
-// CORS - allow all origins since main server handles it
+// CORS
 router.use((req, res, next) => {
-    // Skip CORS for health check (though health check is at root, not here)
-    if (req.path === '/health') {
-        return next();
+    const origin = req.headers.origin;
+    if (origin && ALLOWED_ORIGINS.includes(origin)) {
+        res.header('Access-Control-Allow-Origin', origin);
+        res.header('Access-Control-Allow-Methods', 'GET');
+        res.header('Access-Control-Allow-Headers', 'Content-Type');
+        next();
+    } else if (!origin && process.env.NODE_ENV === 'development') {
+        res.header('Access-Control-Allow-Origin', '*');
+        next();
+    } else {
+        res.header('Access-Control-Allow-Origin', '*');
+        next();
     }
-    
-    // Allow all origins for API endpoints
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET');
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
-    next();
 });
 
 const TEMP_DIR = path.join(__dirname, 'temp_sessions');
@@ -41,11 +41,10 @@ const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 
 if (!ENCRYPTION_KEY) {
     console.error('❌ FATAL: ENCRYPTION_KEY is required');
-    // Don't exit, just log error - main server handles
-    console.error('Please set ENCRYPTION_KEY in environment variables');
+    process.exit(1);
 }
 
-const ENCRYPTION_KEY_HASH = ENCRYPTION_KEY ? crypto.createHash('sha256').update(ENCRYPTION_KEY).digest() : null;
+const ENCRYPTION_KEY_HASH = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
 
 if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -96,10 +95,6 @@ function getCredsFile(sessionDir) {
 }
 
 function encryptSession(credsBase64, sessionId) {
-    if (!ENCRYPTION_KEY_HASH) {
-        throw new Error('ENCRYPTION_KEY not configured');
-    }
-    
     const compressed = zlib.deflateSync(credsBase64);
     const compressedBase64 = compressed.toString('base64');
     
@@ -277,13 +272,11 @@ const splitSessionIntoChunks = (sessionString) => {
 };
 
 // ==================== HEALTH CHECK ENDPOINT ====================
-// Simple health check that doesn't interfere with pairing
 router.get('/health', (req, res) => {
     res.status(200).json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        activePairings: ACTIVE_SESSIONS.size,
-        memory: process.memoryUsage().heapUsed
+        activePairings: ACTIVE_SESSIONS.size
     });
 });
 
@@ -343,12 +336,10 @@ router.get('/', async (req, res) => {
     let responseSent = false;
     let megaUploadStarted = false;
     let sessionDirCreated = false;
-    let exportInProgress = false;
     let connectionListener = null;
     let credsListener = null;
     let megaTimer = null;
     let cleanupTimer = null;
-    let handshakeCompleted = false;
     
     // Register session
     ACTIVE_SESSIONS.set(formattedNumber, {
@@ -400,55 +391,60 @@ router.get('/', async (req, res) => {
         }
     };
     
-    // Wait for WhatsApp handshake to complete
-    const waitForHandshake = (socket, timeoutMs = HANDSHAKE_TIMEOUT) => {
+    // Wait for stable connection (not just handshake)
+    const waitForStableConnection = (socket, stabilityMs = CONNECTION_STABILITY_DELAY) => {
         return new Promise((resolve, reject) => {
             let resolved = false;
-            let connectionAttempts = 0;
+            let connectionTimer = null;
+            let connectionEstablished = false;
             
             const timeout = setTimeout(() => {
                 if (!resolved) {
-                    console.log(`⚠️ [${sessionId}] Handshake timeout after ${timeoutMs}ms`);
+                    console.log(`⚠️ [${sessionId}] Connection timeout`);
                     if (handshakeHandler) socket.ev.off('connection.update', handshakeHandler);
-                    reject(new Error('Handshake timeout - WhatsApp not responding'));
+                    reject(new Error('Connection timeout - WhatsApp not responding'));
                 }
-            }, timeoutMs);
+            }, 30000);
             
             const handshakeHandler = (update) => {
                 const { connection, lastDisconnect } = update;
                 
-                if (connection === 'connecting') {
-                    connectionAttempts++;
-                    console.log(`[${sessionId}] Connection attempt ${connectionAttempts}`);
-                }
+                console.log(`[${sessionId}] Connection update: ${connection || 'unknown'}`);
                 
-                if (connection === 'connecting' && !resolved) {
-                    resolved = true;
-                    clearTimeout(timeout);
-                    socket.ev.off('connection.update', handshakeHandler);
-                    resolve();
-                }
-                
-                if (connection === 'close' && lastDisconnect?.error && !resolved) {
-                    const statusCode = lastDisconnect.error?.output?.statusCode;
-                    const errorMsg = lastDisconnect.error.message || '';
-                    
-                    if (statusCode === 408 || statusCode === 515 || errorMsg.includes('QR refs') || errorMsg.includes('attempts ended')) {
+                // If we get a close event, reject immediately
+                if (connection === 'close') {
+                    if (!resolved) {
                         resolved = true;
                         clearTimeout(timeout);
+                        if (connectionTimer) clearTimeout(connectionTimer);
                         socket.ev.off('connection.update', handshakeHandler);
-                        reject(new Error('WhatsApp rejected connection - too many attempts or rate limited'));
+                        reject(new Error('Connection closed before stable'));
                     }
+                    return;
+                }
+                
+                // When we get "connecting", wait to ensure stability
+                if (connection === 'connecting' && !connectionEstablished) {
+                    console.log(`[${sessionId}] Got connecting, waiting ${stabilityMs/1000}s for stability...`);
+                    connectionEstablished = true;
+                    
+                    connectionTimer = setTimeout(() => {
+                        if (!resolved) {
+                            resolved = true;
+                            clearTimeout(timeout);
+                            socket.ev.off('connection.update', handshakeHandler);
+                            console.log(`✅ [${sessionId}] Connection stable after ${stabilityMs/1000}s`);
+                            resolve();
+                        }
+                    }, stabilityMs);
                 }
                 
                 if (lastDisconnect?.error && !resolved) {
-                    const errorMsg = lastDisconnect.error.message;
-                    if (errorMsg?.includes('QR refs') || errorMsg?.includes('attempts ended')) {
-                        resolved = true;
-                        clearTimeout(timeout);
-                        socket.ev.off('connection.update', handshakeHandler);
-                        reject(new Error('Too many pairing attempts. Please wait and try again.'));
-                    }
+                    resolved = true;
+                    clearTimeout(timeout);
+                    if (connectionTimer) clearTimeout(connectionTimer);
+                    socket.ev.off('connection.update', handshakeHandler);
+                    reject(new Error(`Connection error: ${lastDisconnect.error.message}`));
                 }
             };
             
@@ -456,36 +452,13 @@ router.get('/', async (req, res) => {
         });
     };
     
-    const requestPairingWithRetry = async (socket, phoneNumber, maxRetries = 2) => {
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                console.log(`🔑 [${sessionId}] Requesting pairing code (attempt ${attempt}/${maxRetries})...`);
-                
-                const code = await Promise.race([
-                    socket.requestPairingCode(phoneNumber),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), PAIRING_CODE_TIMEOUT))
-                ]);
-                
-                if (code) return { success: true, code };
-                
-            } catch (err) {
-                console.error(`❌ [${sessionId}] Attempt ${attempt} failed:`, err.message);
-                
-                if (isRateLimitError(err)) {
-                    return { 
-                        success: false, 
-                        error: 'RATE_LIMIT_EXCEEDED',
-                        message: 'Too many pairing attempts. Please wait 5 minutes and try again.'
-                    };
-                }
-                
-                if (attempt < maxRetries) {
-                    console.log(`🔄 [${sessionId}] Waiting 3 seconds before retry...`);
-                    await delay(3000);
-                }
-            }
-        }
-        return { success: false, error: 'All pairing attempts failed' };
+    const requestPairingCode = async (socket, phoneNumber) => {
+        console.log(`🔑 [${sessionId}] Requesting pairing code...`);
+        
+        return await Promise.race([
+            socket.requestPairingCode(phoneNumber),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), PAIRING_CODE_TIMEOUT))
+        ]);
     };
     
     try {
@@ -528,35 +501,19 @@ router.get('/', async (req, res) => {
         };
         currentSock.ev.on('creds.update', credsListener);
         
-        // Wait for handshake BEFORE requesting pairing code
-        console.log(`⏳ [${sessionId}] Waiting for WhatsApp handshake...`);
+        // Wait for stable connection
+        console.log(`⏳ [${sessionId}] Waiting for stable connection...`);
         try {
-            await waitForHandshake(currentSock);
-            console.log(`✅ [${sessionId}] Handshake complete, ready for pairing`);
+            await waitForStableConnection(currentSock);
+            console.log(`✅ [${sessionId}] Connection stable, ready for pairing`);
         } catch (err) {
-            console.error(`❌ [${sessionId}] Handshake failed:`, err.message);
-            
-            if (isRateLimitError(err)) {
-                await forceCleanupNumber(formattedNumber, redactedNumber);
-                
-                sendResponse({
-                    success: false,
-                    error: 'Too many pairing attempts. Please wait 5 minutes and try again.',
-                    sessionId,
-                    code: 'RATE_LIMIT_EXCEEDED',
-                    waitMinutes: 5,
-                    note: 'WhatsApp has temporarily blocked pairing for this number due to too many attempts.'
-                });
-                cleanup(5000, 'rate_limited');
-                return;
-            }
-            
+            console.error(`❌ [${sessionId}] Connection failed:`, err.message);
             sendResponse({
                 success: false,
-                error: `WhatsApp handshake failed: ${err.message}`,
+                error: `Connection failed: ${err.message}`,
                 sessionId
             });
-            cleanup(5000, 'handshake_failed');
+            cleanup(5000, 'connection_failed');
             return;
         }
         
@@ -564,7 +521,6 @@ router.get('/', async (req, res) => {
         connectionListener = async (update) => {
             try {
                 const { connection, lastDisconnect } = update;
-                console.log(`[${sessionId}] Connection: ${connection || 'connecting'}`);
                 
                 if (lastDisconnect?.error) {
                     const statusCode = lastDisconnect.error?.output?.statusCode;
@@ -573,8 +529,10 @@ router.get('/', async (req, res) => {
                         cleanup(5000, 'logged_out');
                         return;
                     }
+                    console.error(`❌ [${sessionId}] Error:`, lastDisconnect.error.message);
                 }
                 
+                // Handle successful connection after pairing
                 if (connection === 'open' && currentSock?.user?.id && !sessionExported && !userConnected) {
                     const connectedNumber = currentSock.user.id.split(':')[0];
                     const phoneMatches = connectedNumber === formattedNumber;
@@ -588,8 +546,10 @@ router.get('/', async (req, res) => {
                             ACTIVE_SESSIONS.get(formattedNumber).state = 'connected';
                         }
                         
-                        await delay(2000);
+                        // Wait for creds to be saved
+                        await delay(3000);
                         
+                        // Wait for creds.json file
                         let credsWait = 0;
                         while (!fs.existsSync(path.join(sessionDir, 'creds.json')) && credsWait < 30) {
                             await delay(500);
@@ -632,6 +592,7 @@ router.get('/', async (req, res) => {
                             console.log(`✅ [${sessionId}] Session exported`);
                             sessionExported = true;
                             
+                            // Mega backup
                             if (!megaUploadStarted) {
                                 megaUploadStarted = true;
                                 megaTimer = setTimeout(async () => {
@@ -662,22 +623,25 @@ router.get('/', async (req, res) => {
         };
         currentSock.ev.on('connection.update', connectionListener);
         
-        // Request pairing code after handshake is complete
-        const pairingResult = await requestPairingWithRetry(currentSock, formattedNumber);
-        
-        if (!pairingResult.success) {
-            if (pairingResult.error === 'RATE_LIMIT_EXCEEDED') {
+        // Request pairing code after connection is stable
+        let pairingCode = null;
+        try {
+            pairingCode = await requestPairingCode(currentSock, formattedNumber);
+        } catch (err) {
+            console.error(`❌ [${sessionId}] Pairing request failed:`, err.message);
+            
+            if (isRateLimitError(err)) {
                 await forceCleanupNumber(formattedNumber, redactedNumber);
                 sendResponse({
                     success: false,
-                    error: pairingResult.message || 'Too many pairing attempts. Please wait 5 minutes and try again.',
+                    error: 'Too many pairing attempts. Please wait 5 minutes and try again.',
                     sessionId,
                     code: 'RATE_LIMIT_EXCEEDED'
                 });
             } else {
                 sendResponse({
                     success: false,
-                    error: `Pairing failed: ${pairingResult.error}`,
+                    error: `Pairing request failed: ${err.message}`,
                     sessionId
                 });
             }
@@ -685,16 +649,25 @@ router.get('/', async (req, res) => {
             return;
         }
         
-        const formattedCode = pairingResult.code.match(/.{1,4}/g)?.join('-') || pairingResult.code;
+        if (!pairingCode) {
+            sendResponse({
+                success: false,
+                error: 'No pairing code received',
+                sessionId
+            });
+            cleanup(5000, 'no_code');
+            return;
+        }
+        
+        const formattedCode = pairingCode.match(/.{1,4}/g)?.join('-') || pairingCode;
         console.log(`✅ [${sessionId}] Pairing code: ${formattedCode}`);
         
         sendResponse({
             success: true,
             code: formattedCode,
-            rawCode: pairingResult.code,
+            rawCode: pairingCode,
             sessionId,
             phoneNumber: redactedNumber,
-            baseUrl: BASE_URL,
             message: 'Enter this code in WhatsApp',
             instructions: [
                 '1. WhatsApp → Settings → Linked Devices',
@@ -705,6 +678,7 @@ router.get('/', async (req, res) => {
             expiresIn: Math.floor(PAIRING_TIMEOUT / 1000)
         });
         
+        // Final timeout
         cleanupTimer = setTimeout(() => {
             if (!sessionExported && !cleaned) {
                 console.log(`⏰ [${sessionId}] Timeout waiting for connection`);
@@ -721,18 +695,7 @@ router.get('/', async (req, res) => {
         
     } catch (error) {
         console.error(`❌ [${sessionId}] Fatal:`, error);
-        
-        if (isRateLimitError(error)) {
-            await forceCleanupNumber(formattedNumber, redactedNumber);
-            if (!responseSent && !cleaned) {
-                sendResponse({ 
-                    success: false, 
-                    error: 'Too many pairing attempts. Please wait 5 minutes and try again.',
-                    sessionId,
-                    code: 'RATE_LIMIT_EXCEEDED'
-                });
-            }
-        } else if (!responseSent && !cleaned) {
+        if (!responseSent && !cleaned) {
             sendResponse({ success: false, error: error.message, sessionId });
         }
         cleanup(5000, 'fatal');
@@ -759,8 +722,6 @@ router.get('/status', (req, res) => {
         activePairings: ACTIVE_SESSIONS.size,
         maxConcurrentPairings: MAX_CONCURRENT_PAIRINGS,
         maxSessions: MAX_SESSIONS,
-        port: PORT,
-        baseUrl: BASE_URL,
         availableSlots: Math.max(0, MAX_CONCURRENT_PAIRINGS - activePairingCount)
     });
 });
