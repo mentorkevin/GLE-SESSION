@@ -7,7 +7,7 @@ import zlib from 'zlib';
 import {
     makeWASocket, useMultiFileAuthState, delay,
     makeCacheableSignalKeyStore, jidNormalizedUser,
-    fetchLatestBaileysVersion, DisconnectReason, Browsers
+    fetchLatestBaileysVersion, Browsers
 } from '@whiskeysockets/baileys';
 
 const router = express.Router();
@@ -46,7 +46,10 @@ router.get('/', async (req, res) => {
     let num = req.query.number;
     if (!num) return res.status(400).json({ error: 'Phone number required' });
 
+    // Clean number
     num = num.replace(/\D/g, '');
+    
+    // Validate
     const phone = pn('+' + num);
     if (!phone.isValid()) {
         if (num.length === 10 && !num.startsWith('1')) num = '1' + num;
@@ -58,95 +61,70 @@ router.get('/', async (req, res) => {
     const whatsappNumber = pn('+' + num).getNumber('e164').replace('+', '');
     console.log(`📱 Pairing for: +${whatsappNumber}`);
     
-    const sessionId = Date.now().toString() + Math.random().toString(36).substring(2, 9);
-    const sessionDir = `./temp/${sessionId}`;
-    
+    const sessionDir = `./temp/${Date.now()}`;
     await fs.ensureDir(sessionDir);
     
     let responseSent = false;
     let sock = null;
-    let socketReady = false;
     
     try {
+        // 1. Setup auth state
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        
+        // 2. Get latest version
         const { version } = await fetchLatestBaileysVersion();
         
-        // Use the SAME browser as qr.js - Ubuntu Chrome
+        // 3. Create socket - THIS IS THE CORRECT ARCHITECTURE
         sock = makeWASocket({
             version,
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" }))
-            },
+            auth: state,
             printQRInTerminal: false,
-            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-            browser: Browsers.ubuntu("Chrome"),  // Same as qr.js
+            logger: pino({ level: "silent" }),
+            browser: Browsers.ubuntu("Chrome"),
             markOnlineOnConnect: false
         });
         
+        // 4. Handle credentials update
         sock.ev.on('creds.update', saveCreds);
         
-        sock.ev.on('connection.update', (update) => {
-            console.log(`🔔 Connection: ${update.connection || 'connecting'}`);
-            if (update.connection === 'connecting') {
-                socketReady = true;
-                console.log('✅ Socket ready for pairing');
-            }
-        });
-        
+        // 5. Handle connection - THIS IS THE CORRECT ORDER
         sock.ev.on('connection.update', async (update) => {
             const { connection } = update;
+            console.log(`📡 Connection: ${connection}`);
+            
+            // When user enters code, this fires
             if (connection === 'open') {
-                console.log('✅ User connected! Sending session...');
+                console.log('✅ User connected!');
                 try {
-                    const credsFile = `${sessionDir}/creds.json`;
-                    if (await fs.pathExists(credsFile)) {
-                        const credsBase64 = (await fs.readFile(credsFile)).toString('base64');
-                        const sessionString = encryptSession(credsBase64);
-                        const userJid = jidNormalizedUser(whatsappNumber + '@s.whatsapp.net');
-                        
-                        await sock.sendMessage(userJid, { text: sessionString });
-                        console.log('📤 Session sent');
-                        
-                        await sock.sendMessage(userJid, { text: MESSAGE });
-                        console.log('📢 Warning sent');
-                        
-                        await delay(2000);
-                        await sock.end();
-                        await fs.remove(sessionDir);
-                    }
+                    const credsBase64 = (await fs.readFile(`${sessionDir}/creds.json`)).toString('base64');
+                    const sessionString = encryptSession(credsBase64);
+                    const userJid = jidNormalizedUser(whatsappNumber + '@s.whatsapp.net');
+                    
+                    await sock.sendMessage(userJid, { text: sessionString });
+                    console.log('📤 Session sent');
+                    
+                    await sock.sendMessage(userJid, { text: MESSAGE });
+                    
+                    await delay(2000);
+                    await sock.end();
+                    await fs.remove(sessionDir);
                 } catch (err) {
-                    console.error('Error sending session:', err);
+                    console.error('Error:', err);
                 }
             }
         });
         
-        console.log('⏳ Waiting for socket to be ready...');
-        let attempts = 0;
-        while (!socketReady && attempts < 20) {
-            await delay(500);
-            attempts++;
-        }
-        
-        if (!socketReady) {
-            console.error('❌ Socket never became ready');
-            if (!responseSent) {
-                responseSent = true;
-                return res.status(500).json({ error: 'Connection failed' });
-            }
-        }
-        
-        console.log(`🔑 Requesting pairing code for ${whatsappNumber}...`);
+        // 6. Request pairing code - THIS IS THE KEY: MUST HAPPEN AFTER SOCKET CREATION
+        // The socket connects automatically, we just need to wait a moment
+        console.log('🔑 Requesting pairing code...');
+        await delay(2000);
         let code = await sock.requestPairingCode(whatsappNumber);
         code = code?.match(/.{1,4}/g)?.join('-') || code;
         
         console.log(`✅ Pairing code: ${code}`);
+        res.json({ success: true, code: code });
         
-        if (!responseSent) {
-            responseSent = true;
-            res.json({ success: true, code: code });
-        }
-        
+        // Cleanup after 2 minutes
         setTimeout(async () => {
             try {
                 if (sock) await sock.end();
@@ -156,26 +134,24 @@ router.get('/', async (req, res) => {
         
     } catch (err) {
         console.error('❌ Error:', err);
-        if (!responseSent) {
-            res.status(500).json({ error: err.message });
-        }
+        if (!responseSent) res.status(500).json({ error: err.message });
         if (sock) await sock.end();
         await fs.remove(sessionDir);
     }
 });
 
+// Cleanup old sessions
 setInterval(async () => {
     try {
-        const baseDir = './temp';
-        if (!await fs.pathExists(baseDir)) return;
-        const sessions = await fs.readdir(baseDir);
+        const dir = './temp';
+        if (!await fs.pathExists(dir)) return;
+        const sessions = await fs.readdir(dir);
         const now = Date.now();
         for (const session of sessions) {
-            const sessionPath = `${baseDir}/${session}`;
-            const stats = await fs.stat(sessionPath);
-            if (now - stats.mtimeMs > 10 * 60 * 1000) {
-                await fs.remove(sessionPath);
-                console.log(`🧹 Cleaned old session: ${session}`);
+            const path = `${dir}/${session}`;
+            const stat = await fs.stat(path);
+            if (now - stat.mtimeMs > 10 * 60 * 1000) {
+                await fs.remove(path);
             }
         }
     } catch (e) {}
