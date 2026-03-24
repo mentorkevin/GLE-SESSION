@@ -7,7 +7,7 @@ import zlib from 'zlib';
 import {
     makeWASocket, useMultiFileAuthState, delay,
     makeCacheableSignalKeyStore, jidNormalizedUser,
-    fetchLatestBaileysVersion, DisconnectReason
+    fetchLatestBaileysVersion, DisconnectReason, Browsers
 } from '@whiskeysockets/baileys';
 
 const router = express.Router();
@@ -71,6 +71,7 @@ router.get('/', async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         const { version } = await fetchLatestBaileysVersion();
         
+        // Use the SAME browser as qr.js - Ubuntu Chrome
         sock = makeWASocket({
             version,
             auth: {
@@ -79,7 +80,7 @@ router.get('/', async (req, res) => {
             },
             printQRInTerminal: false,
             logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-            browser: ["Chrome (Linux)", "", ""],
+            browser: Browsers.ubuntu("Chrome"),  // Same as qr.js
             markOnlineOnConnect: false
         });
         
