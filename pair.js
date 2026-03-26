@@ -1,193 +1,137 @@
 import express from 'express';
-import fs from 'fs-extra';
+import fs from 'fs';
 import pino from 'pino';
-import pn from 'awesome-phonenumber';
-import crypto from 'crypto';
-import zlib from 'zlib';
-import {
-    makeWASocket, useMultiFileAuthState, delay,
-    makeCacheableSignalKeyStore, jidNormalizedUser,
-    fetchLatestBaileysVersion
-} from '@whiskeysockets/baileys';
-import { uploadSession as megaUpload } from './mega.js';
+import { makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore, Browsers, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { upload } from './mega.js';
 
 const router = express.Router();
-const SESSION_PREFIX = 'GleBot!';
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 
-if (!ENCRYPTION_KEY) {
-    console.error('❌ ENCRYPTION_KEY required');
-    process.exit(1);
-}
-
-const ENCRYPTION_KEY_HASH = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
-
-const CHANNEL_LINK = "https://whatsapp.com/channel/0029VbBTYeRJP215nxFl4I0x";
-const MESSAGE = `⚠️ *DO NOT SHARE THIS SESSION WITH ANYONE* ⚠️
-
-┌┤✑  Thanks for using GleBot
-│└────────────┈ ⳹        
-│ ©2026 GleBot Inc. All rights reserved.
-└─────────────────┈ ⳹
-
-📢 Join our channel: ${CHANNEL_LINK}`;
-
-function generatePairingCode() {
-    return Math.floor(10000000 + Math.random() * 90000000).toString();
-}
-
-function createSessionString(credsData) {
-    const compressed = zlib.gzipSync(credsData);
-    const compressedBase64 = compressed.toString('base64');
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY_HASH, iv);
-    let encrypted = cipher.update(compressedBase64, 'utf8', 'base64');
-    encrypted += cipher.final('base64');
-    const authTag = cipher.getAuthTag().toString('base64');
-    return `${SESSION_PREFIX}${iv.toString('base64')}:${encrypted}:${authTag}`;
+// Ensure the session directory exists
+function removeFile(FilePath) {
+    try {
+        if (!fs.existsSync(FilePath)) return false;
+        fs.rmSync(FilePath, { recursive: true, force: true });
+    } catch (e) {
+        console.error('Error removing file:', e);
+    }
 }
 
 router.get('/', async (req, res) => {
     let num = req.query.number;
-    if (!num) return res.status(400).json({ error: 'Phone number required' });
+    let dirs = './' + (num || `session`);
+    
+    // Remove existing session if present
+    await removeFile(dirs);
 
-    num = num.replace(/\D/g, '');
-    console.log(`📱 Number: ${num}`);
-    
-    const sessionId = Date.now().toString() + Math.random().toString(36).substring(2, 9);
-    const sessionDir = `./temp/${sessionId}`;
-    await fs.ensureDir(sessionDir);
-    
-    let responseSent = false;
-    let sock = null;
-    let connectionEstablished = false;
-    let pairingCodeSent = false;
-    
-    try {
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        const { version } = await fetchLatestBaileysVersion();
-        
-        sock = makeWASocket({
-            version,
-            auth: state,
-            printQRInTerminal: false,
-            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-            browser: ["Chrome (Linux)", "", ""],
-            markOnlineOnConnect: false,
-            syncFullHistory: false
-        });
-        
-        sock.ev.on('creds.update', saveCreds);
-        
-        // Handle when user enters the PAIRING CODE and connects
-        sock.ev.on('connection.update', async (update) => {
-            const { connection } = update;
-            console.log(`📡 Connection: ${connection || 'connecting'}`);
+    let retryCount = 0;
+    const MAX_RETRIES = 5;
+
+    // Enhanced session initialization function
+    async function initiateSession() {
+        const { state, saveCreds } = await useMultiFileAuthState(dirs);
+
+        try {
+            // Initialize socket connection
+let Um4r719 = makeWASocket({
+          auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })),
+                },
+        version: [2,3000,1033105955],
+        printQRInTerminal: false,
+        logger: pino({
+          level: 'silent',
+        }),
+        browser: Browsers.windows('Edge'),
+      })
             
-            if (connection === 'open' && !connectionEstablished) {
-                connectionEstablished = true;
-                console.log('✅ User entered pairing code and connected!');
-                
-                try {
-                    await delay(3000);
-                    
-                    const credsPath = `${sessionDir}/creds.json`;
-                    if (await fs.pathExists(credsPath)) {
-                        const credsData = await fs.readFile(credsPath);
-                        const sessionString = createSessionString(credsData);
-                        const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
-                        
-                        await sock.sendMessage(userJid, { text: sessionString });
-                        console.log('📤 Session sent');
-                        
-                        try {
-                            const megaLink = await megaUpload(sessionString, sessionId);
-                            if (megaLink && !megaLink.startsWith('local://')) {
-                                await sock.sendMessage(userJid, { text: `💾 Mega Backup: ${megaLink}` });
-                            }
-                        } catch (e) {}
-                        
-                        await sock.sendMessage(userJid, { text: MESSAGE });
-                        await delay(2000);
-                        await sock.end();
-                        await fs.remove(sessionDir);
-                        console.log('✅ Complete');
-                    }
-                } catch (err) {
-                    console.error('Error:', err);
+            if (!Um4r719.authState.creds.registered) {
+                await delay(2000);
+                num = num.replace(/[^0-9]/g, '');
+                const custom = "BLIZZARD";
+                const code = await Um4r719.requestPairingCode(num,custom);
+                if (!res.headersSent) {
+                    console.log({ num, code });
+                    await res.send({ code });
                 }
             }
-        });
-        
-        // STEP 1: Wait for WhatsApp connection to be established
-        console.log('⏳ Waiting for WhatsApp connection...');
-        await new Promise((resolve) => {
-            const timeout = setTimeout(() => resolve(), 15000);
-            const handler = (update) => {
-                if (update.connection === 'connecting') {
-                    console.log('✅ WhatsApp connection established');
-                    clearTimeout(timeout);
-                    sock.ev.off('connection.update', handler);
-                    resolve();
+
+            Um4r719.ev.on('creds.update', saveCreds);
+
+            Um4r719.ev.on("connection.update", async (s) => {
+                const { connection, lastDisconnect } = s;
+
+                if (connection === "open") {
+                    await Um4r719.sendMessage(Um4r719.user.id, { text: `Generating your BLACK MD session wait a moment`});
+                    console.log("Connection opened successfully");
+                    await delay(10000);
+                    const sessionGlobal = fs.readFileSync(dirs + '/creds.json');
+
+                    // Helper to generate a random Mega file ID
+                    function generateRandomId(length = 6, numberLength = 4) {
+                        const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+                        let result = '';
+                        for (let i = 0; i < length; i++) {
+                            result += characters.charAt(Math.floor(Math.random() * characters.length));
+                        }
+                        const number = Math.floor(Math.random() * Math.pow(10, numberLength));
+                        return `${result}${number}`;
+                    }
+
+                    // Upload session file to Mega
+                    const megaUrl = await upload(fs.createReadStream(`${dirs}/creds.json`), `${generateRandomId()}.json`);
+
+                    // Add "UMAR=" prefix to the session ID
+                    let stringSession = `${megaUrl.replace('https://mega.nz/file/', 'BLACK-MD;;;')}`;
+
+                    // Send the session ID to the target number
+                    await Um4r719.sendMessage(Um4r719.user.id, { text: stringSession });
+
+                    // Send confirmation message
+                    await Um4r719.sendMessage(Um4r719.user.id, { 
+                        text: 'BLACK MD has been linked SUCCESSFUL \nCopy and paste it on the SESSION string during deploy as it will be used for authentication.\n\nIncase you are facing Any issue reach me HERE👇\n\nhttps://wa.me/message/KPRFMNA4UYOXE1\n\nAnd dont forget to sleep😴, for even the rentless must recharge⚡.\n\nGoodluck 🎉.\n' 
+                    });
+
+                    // Clean up session after use
+                    await delay(100);
+                    removeFile(dirs);
+                    process.exit(0);
+                } else if (connection === 'close' && lastDisconnect && lastDisconnect.error && lastDisconnect.error.output.statusCode !== 401) {
+                    console.log('Connection closed unexpectedly:', lastDisconnect.error);
+                    retryCount++;
+
+                    if (retryCount < MAX_RETRIES) {
+                        console.log(`Retrying connection... Attempt ${retryCount}/${MAX_RETRIES}`);
+                        await delay(10000);
+                        initiateSession();
+                    } else {
+                        console.log('Max retries reached, stopping reconnection attempts.');
+                        await res.status(500).send({ message: 'Unable to reconnect after multiple attempts.' });
+                    }
                 }
-            };
-            sock.ev.on('connection.update', handler);
-        });
-        
-        // STEP 2: Generate the pairing code
-        const pairingCode = generatePairingCode();
-        console.log(`🔑 Generated code: ${pairingCode}`);
-        
-        // STEP 3: Request WhatsApp to send the code to the user's phone
-        console.log(`📱 Requesting WhatsApp to send code to ${num}...`);
-        await sock.requestPairingCode(num, pairingCode);
-        
-        // STEP 4: NOW WhatsApp has sent the notification, so we can reveal the code
-        console.log(`✅ WhatsApp has sent "${pairingCode}" to the user's phone`);
-        
-        const formattedCode = pairingCode.match(/.{1,4}/g)?.join('-') || pairingCode;
-        
-        if (!responseSent) {
-            responseSent = true;
-            res.json({ 
-                success: true, 
-                code: formattedCode,
-                message: 'Check your WhatsApp - you will receive a notification with this code'
             });
+        } catch (err) {
+            console.error('Error initializing session:', err);
+            if (!res.headersSent) {
+                res.status(503).send({ code: 'Service Unavailable' });
+            }
         }
-        
-        // STEP 5: Wait for user to enter the code (3 minutes)
-        console.log('⏳ Waiting for user to enter code...');
-        await new Promise((resolve) => setTimeout(resolve, 180000));
-        
-        if (!connectionEstablished) {
-            console.log('⏰ No connection - cleaning up');
-            await sock.end();
-            await fs.remove(sessionDir);
-        }
-        
-    } catch (err) {
-        console.error('❌ Error:', err.message);
-        if (!responseSent) res.status(500).json({ error: err.message });
-        if (sock) await sock.end();
-        await fs.remove(sessionDir);
     }
+
+    await initiateSession();
 });
 
-setInterval(async () => {
-    try {
-        const dir = './temp';
-        if (!await fs.pathExists(dir)) return;
-        const sessions = await fs.readdir(dir);
-        const now = Date.now();
-        for (const session of sessions) {
-            const path = `${dir}/${session}`;
-            const stat = await fs.stat(path);
-            if (now - stat.mtimeMs > 30 * 60 * 1000) {
-                await fs.remove(path);
-            }
-        }
-    } catch (e) {}
-}, 60000);
+// Ensure session cleanup on exit or uncaught exceptions
+process.on('exit', () => {
+    removeFile(dirs);
+    console.log('Session file removed.');
+});
+
+// Catch uncaught errors and handle session cleanup
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception:', err);
+    removeFile(dirs);
+    process.exit(1);  // Ensure the process exits with error
+});
 
 export default router;
